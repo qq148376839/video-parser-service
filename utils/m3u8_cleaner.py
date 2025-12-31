@@ -4,6 +4,8 @@ M3U8清理工具模块
 """
 import re
 from typing import List
+from urllib.parse import urlparse
+from collections import Counter
 from utils.logger import logger
 
 
@@ -19,7 +21,7 @@ class M3U8Cleaner:
     @staticmethod
     def clean_m3u8_content(content: str) -> str:
         """
-        清理m3u8文件内容，移除包含特定域名的行
+        清理m3u8文件内容，通过统计域名频率移除少数派域名（通常是广告或注入）
         
         确保删除URL时同时删除对应的#EXTINF标签，避免产生孤立的标签
         
@@ -30,49 +32,58 @@ class M3U8Cleaner:
             清理后的m3u8文件内容
         """
         lines = content.split('\n')
+        
+        # 1. 统计所有绝对路径URL的域名
+        urls = [line.strip() for line in lines if line.strip().startswith(('http://', 'https://'))]
+        absolute_domains = [urlparse(url).netloc for url in urls]
+        
+        # 如果没有绝对路径URL，直接返回原始内容（或者是纯相对路径，无需清理）
+        if not absolute_domains:
+            return content
+            
+        domain_counts = Counter(absolute_domains)
+        
+        # 找到出现次数最多的域名（可能有多个并列第一）
+        # 这里的逻辑是：保留多数派域名，清理少数派域名
+        max_count = domain_counts.most_common(1)[0][1]
+        majority_domains = {d for d, c in domain_counts.items() if c == max_count}
+        
         cleaned_lines = []
-        skip_next = False
+        removed_count = 0
         
         for i, line in enumerate(lines):
-            # 如果上一行标记了跳过，跳过当前行（通常是URL行）
-            if skip_next:
-                skip_next = False
+            line_stripped = line.strip()
+            
+            should_remove = False
+            
+            # 检查是否是绝对路径URL
+            if line_stripped.startswith(('http://', 'https://')):
+                current_domain = urlparse(line_stripped).netloc
+                
+                # 如果当前域名不在多数派域名中，说明是少数派（注入/广告），需要清理
+                if current_domain not in majority_domains:
+                    should_remove = True
+            
+            # 兼容旧的模式匹配逻辑（可选，如果用户还想保留特定的黑名单）
+            # 如果尚未决定删除，再检查黑名单
+            if not should_remove:
+                for pattern in M3U8Cleaner.CLEAN_PATTERNS:
+                    if re.search(pattern, line, re.IGNORECASE):
+                        should_remove = True
+                        break
+
+            if should_remove:
+                # 检查前一行是否是#EXTINF标签，如果是也删除
+                if cleaned_lines and cleaned_lines[-1].strip().startswith('#EXTINF'):
+                    cleaned_lines.pop()
+                    # logger.debug(f"删除孤立的#EXTINF标签")
+                
+                removed_count += 1
                 continue
             
-            # 检查当前行是否包含需要清理的域名
-            should_skip = False
-            for pattern in M3U8Cleaner.CLEAN_PATTERNS:
-                if re.search(pattern, line, re.IGNORECASE):
-                    should_skip = True
-                    break
-            
-            if should_skip:
-                line_stripped = line.strip()
-                
-                # 情况1: 如果当前行是URL行（以http开头），需要检查前一行是否是#EXTINF
-                # 如果是，也要删除前一行（#EXTINF标签），避免产生孤立的标签
-                if line_stripped.startswith('http'):
-                    # 检查前一行是否是#EXTINF标签
-                    if cleaned_lines and cleaned_lines[-1].strip().startswith('#EXTINF'):
-                        # 删除前一行（#EXTINF标签）
-                        cleaned_lines.pop()
-                        logger.debug(f"删除孤立的#EXTINF标签（对应URL包含清理域名）")
-                    # 跳过当前URL行
-                    continue
-                
-                # 情况2: 如果当前行是#EXTINF行且包含清理域名，跳过当前行和下一行（URL行）
-                elif line_stripped.startswith('#EXTINF'):
-                    skip_next = True
-                    continue
-                
-                # 情况3: 其他包含清理域名的行（如注释等），直接跳过
-                continue
-            
-            # 正常行，添加到清理后的列表
             cleaned_lines.append(line)
         
         # 后处理：清理可能存在的孤立#EXTINF标签（双重保险）
-        # 检查是否有#EXTINF标签后面没有URL的情况（只删除明显孤立的标签）
         final_lines = []
         i = 0
         while i < len(cleaned_lines):
@@ -83,8 +94,11 @@ class M3U8Cleaner:
             if line_stripped.startswith('#EXTINF'):
                 if i + 1 < len(cleaned_lines):
                     next_line = cleaned_lines[i + 1].strip()
-                    # 如果下一行是URL，保留这两行
-                    if next_line.startswith('http'):
+                    # 如果下一行是URL（绝对或相对），保留这两行
+                    # 判断逻辑：是http开头，或者不以#开头且非空（相对路径）
+                    is_url = next_line.startswith(('http://', 'https://')) or (next_line and not next_line.startswith('#'))
+                    
+                    if is_url:
                         final_lines.append(line)
                         final_lines.append(cleaned_lines[i + 1])
                         i += 2
@@ -96,17 +110,16 @@ class M3U8Cleaner:
                         continue
                     # 如果下一行是空行或注释，可能是格式问题，也删除
                     elif not next_line or next_line.startswith('#'):
-                        logger.warning(f"发现并删除孤立的#EXTINF标签（行 {i+1}，下一行不是URL）")
+                        # logger.warning(f"发现并删除孤立的#EXTINF标签（行 {i+1}，下一行不是URL）")
                         i += 1
                         continue
                     else:
-                        # 其他情况，可能是合法的，保留
                         final_lines.append(line)
                         i += 1
                         continue
                 else:
                     # 文件末尾的孤立#EXTINF标签
-                    logger.warning(f"发现并删除文件末尾的孤立#EXTINF标签（行 {i+1}）")
+                    # logger.warning(f"发现并删除文件末尾的孤立#EXTINF标签（行 {i+1}）")
                     i += 1
                     continue
             
@@ -116,13 +129,8 @@ class M3U8Cleaner:
         
         cleaned_content = '\n'.join(final_lines)
         
-        # 统计清理的行数
-        original_line_count = len(lines)
-        final_line_count = len(final_lines)
-        removed_count = original_line_count - final_line_count
-        
         if removed_count > 0:
-            logger.info(f"M3U8清理: 移除了 {removed_count} 行包含清理域名的内容")
+            logger.info(f"M3U8清理: 移除了 {removed_count} 行内容（基于域名频率或黑名单）")
         
         return cleaned_content
     
