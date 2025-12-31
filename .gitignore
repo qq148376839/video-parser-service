@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志文件
+*.log
+data/logs/
+
+# 缓存文件
+data/m3u8_cache/*.m3u8
+
+# 调试文件
+*.html
+*.json
+!data/config.json
+!data/registration_results.json
+!data/z_params.json
+!config.json.example
+
+# 测试文件
+final_parse_result*.json
+iframe_page*.html
+z_param_debug.html
+
+# 临时文件
+*.tmp
+*.bak
+
+# 操作系统
+.DS_Store
+Thumbs.db

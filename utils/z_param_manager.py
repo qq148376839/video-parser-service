@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Dict
 from datetime import datetime, timedelta
 from .logger import logger
+from .file_lock import FileLock
 
 # 数据目录
 DATA_DIR = Path("/app/data")
@@ -29,19 +30,38 @@ class ZParamManager:
     
     def load_params(self) -> Dict:
         """
-        从文件加载z参数
+        从文件加载z参数（使用文件锁）
         
         Returns:
             z参数字典
         """
         try:
             if Z_PARAMS_FILE.exists():
-                with open(Z_PARAMS_FILE, 'r', encoding='utf-8') as f:
-                    self.z_params = json.load(f)
-                logger.info("z参数加载成功")
+                try:
+                    with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
+                        self.z_params = json.load(f)
+                    logger.info("z参数加载成功")
+                except TimeoutError:
+                    logger.warning("z参数文件锁超时，尝试直接读取")
+                    with open(Z_PARAMS_FILE, 'r', encoding='utf-8') as f:
+                        self.z_params = json.load(f)
+                    logger.info("z参数加载成功（直接读取）")
             else:
                 logger.warning("z参数文件不存在，将使用默认值或自动获取")
                 self.z_params = {}
+            return self.z_params
+        except json.JSONDecodeError as e:
+            logger.error(f"加载z参数失败（JSON解析错误）: {e}")
+            # JSON文件可能损坏，尝试备份并重置
+            try:
+                backup_file = Z_PARAMS_FILE.with_suffix('.json.bak')
+                if Z_PARAMS_FILE.exists():
+                    import shutil
+                    shutil.copy2(Z_PARAMS_FILE, backup_file)
+                    logger.warning(f"已备份损坏的z参数文件到: {backup_file}")
+            except:
+                pass
+            self.z_params = {}
             return self.z_params
         except Exception as e:
             logger.error(f"加载z参数失败: {e}")
@@ -50,7 +70,7 @@ class ZParamManager:
     
     def save_params(self, z_param: str, s1ig_param: str = "11397", g_param: str = "") -> bool:
         """
-        保存z参数到文件
+        保存z参数到文件（使用文件锁）
         
         Args:
             z_param: z参数值
@@ -70,8 +90,15 @@ class ZParamManager:
                 "source": "playwright"
             }
             
-            with open(Z_PARAMS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.z_params, f, indent=2, ensure_ascii=False)
+            try:
+                with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
+                    f.seek(0)
+                    f.truncate(0)
+                    json.dump(self.z_params, f, indent=2, ensure_ascii=False)
+            except TimeoutError:
+                logger.warning("z参数文件锁超时，尝试直接写入")
+                with open(Z_PARAMS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(self.z_params, f, indent=2, ensure_ascii=False)
             
             logger.info("z参数保存成功")
             return True

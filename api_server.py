@@ -3,8 +3,9 @@ FastAPI主服务
 提供视频解析和资源检索API接口
 """
 import time
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
+import os
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, PlainTextResponse
 from typing import Optional
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
@@ -12,6 +13,7 @@ from urllib.parse import unquote
 from utils.logger import logger, setup_logger
 from utils.config_loader import config_loader
 from utils.z_param_manager import z_param_manager
+from parsers.paid_key_parser import PaidKeyParser
 from parsers.z_param_parser import ZParamParser
 from parsers.decrypt_parser import DecryptParser
 from parsers.search_parser import SearchParser
@@ -21,6 +23,7 @@ setup_logger("video_parser", log_file="api_server.log")
 
 # 全局变量
 app_start_time = time.time()
+paid_key_parser = None
 z_param_parser = None
 decrypt_parser = None
 search_parser = None
@@ -29,14 +32,19 @@ search_parser = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global z_param_parser, decrypt_parser, search_parser
+    global paid_key_parser, z_param_parser, decrypt_parser, search_parser
     
     # 启动时初始化
     logger.info("=" * 60)
     logger.info("视频解析API服务启动")
     logger.info("=" * 60)
     
-    # 初始化解析器
+    # 获取API基础URL（从环境变量或使用默认值）
+    api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
+    
+    # 初始化解析器（按优先级顺序）
+    # 注意：PaidKeyParser需要API基础URL来生成本地m3u8接口链接
+    paid_key_parser = PaidKeyParser(api_base_url=api_base_url)
     z_param_parser = ZParamParser()
     decrypt_parser = DecryptParser()
     search_parser = SearchParser()
@@ -71,6 +79,7 @@ async def root():
         "endpoints": {
             "parse": "/api/v1/parse",
             "search": "/api/v1/search",
+            "m3u8": "/api/v1/m3u8/{file_id}",
             "health": "/health"
         }
     }
@@ -104,13 +113,21 @@ async def parse_video(
     logger.info(f"收到解析请求: {video_url}")
     
     try:
-        # 先尝试z参数方案（在线程中运行，避免阻塞事件循环）
         import asyncio
-        m3u8_url = await asyncio.to_thread(z_param_parser.parse, video_url)
-        method = "z_param"
+        
+        # 优先级1: 2s0解析（在线程中运行，避免阻塞事件循环）
+        m3u8_url = await asyncio.to_thread(paid_key_parser.parse, video_url)
+        method = "paid_key"
         fallback_used = False
         
-        # 如果失败，使用解密方案（也在线程中运行）
+        # 优先级2: z参数解析
+        if not m3u8_url:
+            logger.info("2s0解析方案失败，切换到z参数方案")
+            m3u8_url = await asyncio.to_thread(z_param_parser.parse, video_url)
+            method = "z_param"
+            fallback_used = True
+        
+        # 优先级3: 解密解析
         if not m3u8_url:
             logger.info("z参数方案失败，切换到解密方案")
             m3u8_url = await asyncio.to_thread(decrypt_parser.parse, parser_url, video_url)
@@ -187,6 +204,54 @@ async def search_videos(
     except Exception as e:
         logger.error(f"搜索异常: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"搜索失败: {str(e)}")
+
+
+@app.get("/api/v1/m3u8/{file_id}")
+async def get_m3u8_file(file_id: str, request: Request):
+    """
+    获取下载的m3u8文件内容
+    
+    Args:
+        file_id: 文件ID（由2s0解析器生成）
+        request: FastAPI请求对象
+    
+    Returns:
+        m3u8文件内容（text/plain格式）
+    """
+    if not paid_key_parser:
+        raise HTTPException(status_code=503, detail="2s0解析器未初始化")
+    
+    # 获取m3u8文件路径
+    m3u8_file_path = paid_key_parser.get_m3u8_file_path(file_id)
+    
+    if not m3u8_file_path:
+        logger.warning(f"请求的m3u8文件不存在: file_id={file_id}")
+        raise HTTPException(status_code=404, detail=f"m3u8文件不存在: {file_id}")
+    
+    # 检查文件是否存在
+    if not os.path.exists(m3u8_file_path):
+        logger.error(f"m3u8文件路径不存在: {m3u8_file_path}")
+        raise HTTPException(status_code=404, detail="m3u8文件不存在")
+    
+    try:
+        # 读取文件内容
+        with open(m3u8_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        logger.debug(f"返回m3u8文件: file_id={file_id}, 大小={len(content)} 字节")
+        
+        # 返回文件内容，设置正确的Content-Type
+        return PlainTextResponse(
+            content=content,
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Content-Disposition": f'inline; filename="{file_id}.m3u8"',
+                "Cache-Control": "no-cache"
+            }
+        )
+    except Exception as e:
+        logger.error(f"读取m3u8文件失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"读取m3u8文件失败: {str(e)}")
 
 
 @app.get("/health")
