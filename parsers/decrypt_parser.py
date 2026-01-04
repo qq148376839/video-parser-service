@@ -1,21 +1,13 @@
 """
 解密解析器模块
-基于final_direct_parser_v2.py的解密方案（备选方案）
+基于解析网站API的解密方案（备选方案）
 """
-import sys
-from pathlib import Path
-
-# 添加项目根目录到路径
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
-from final_direct_parser_v2 import FinalDirectParserV2
 from typing import Optional
 import requests
 import re
-import os
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urljoin, urlparse, quote
 from utils.logger import logger
 from utils.m3u8_cleaner import M3U8Cleaner
 
@@ -28,7 +20,13 @@ class DecryptParser:
     
     def __init__(self):
         """初始化解密解析器"""
-        self.parser = FinalDirectParserV2()
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Referer': 'https://jx.789jiexi.com/',
+        })
         logger.info("解密解析器初始化完成")
     
     def parse(self, parser_url: str, video_url: str) -> Optional[str]:
@@ -54,15 +52,82 @@ class DecryptParser:
                 
                 if first_episode_end < len(video_url):
                     video_url = video_url[:first_episode_end]
-                    logger.debug(f"检测到多集URL，只解析第一集: {video_url[:100]}...")
+                    logger.debug(f"解密解析器: 检测到多集URL，只解析第一集: {video_url[:100]}...")
             
-            logger.info(f"使用解密方案解析: {video_url}")
-            result_url = self.parser.parse_video(parser_url, video_url)
+            # 验证URL格式
+            if not video_url or not video_url.startswith(('http://', 'https://')):
+                logger.error(f"解密解析器: 无效的视频URL格式: {video_url}")
+                return None
+            
+            logger.info(f"解密解析器: 使用解密方案解析: {video_url[:100]}...")
+            
+            # 构造解析API URL（常见的解析网站API格式）
+            # 尝试多种常见的API格式
+            encoded_video_url = quote(video_url, safe='')
+            api_urls = [
+                urljoin(parser_url.rstrip('/'), f'/api/?url={encoded_video_url}'),
+                urljoin(parser_url.rstrip('/'), f'/api.php?url={encoded_video_url}'),
+                urljoin(parser_url.rstrip('/'), f'/?url={encoded_video_url}'),
+            ]
+            
+            result_url = None
+            for api_url in api_urls:
+                try:
+                    logger.debug(f"解密解析器: 尝试API URL: {api_url[:100]}...")
+                    response = self.session.get(api_url, timeout=15, allow_redirects=True)
+                    
+                    if response.status_code == 200:
+                        # 尝试从响应中提取m3u8或mp4链接
+                        content = response.text
+                        
+                        # 匹配m3u8链接
+                        m3u8_patterns = [
+                            r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*',
+                            r'["\']([^"\']+\.m3u8[^"\']*)["\']',
+                        ]
+                        
+                        for pattern in m3u8_patterns:
+                            matches = re.findall(pattern, content, re.IGNORECASE)
+                            if matches:
+                                result_url = matches[0]
+                                # 如果匹配结果包含引号，需要清理
+                                result_url = result_url.strip('"\'')
+                                if not result_url.startswith(('http://', 'https://')):
+                                    # 如果是相对路径，转换为绝对路径
+                                    result_url = urljoin(parser_url, result_url)
+                                logger.info(f"解密解析器: 从响应中提取到m3u8链接: {result_url[:100]}...")
+                                break
+                        
+                        # 如果没有找到m3u8，尝试匹配mp4链接
+                        if not result_url:
+                            mp4_patterns = [
+                                r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*',
+                                r'["\']([^"\']+\.mp4[^"\']*)["\']',
+                            ]
+                            
+                            for pattern in mp4_patterns:
+                                matches = re.findall(pattern, content, re.IGNORECASE)
+                                if matches:
+                                    result_url = matches[0]
+                                    # 如果匹配结果包含引号，需要清理
+                                    result_url = result_url.strip('"\'')
+                                    if not result_url.startswith(('http://', 'https://')):
+                                        result_url = urljoin(parser_url, result_url)
+                                    logger.info(f"解密解析器: 从响应中提取到mp4链接: {result_url[:100]}...")
+                                    break
+                        
+                        # 如果找到了结果，跳出循环
+                        if result_url:
+                            break
+                            
+                except requests.RequestException as e:
+                    logger.debug(f"解密解析器: API请求失败: {e}")
+                    continue
             
             if result_url:
                 # 检查返回的URL类型
                 if '.m3u8' in result_url.lower():
-                    logger.info(f"解密方案解析成功（m3u8）: {result_url[:100]}...")
+                    logger.info(f"解密解析器: 解密方案解析成功（m3u8）: {result_url[:100]}...")
                     # 下载并清理m3u8文件
                     cleaned_url = self._download_and_clean_m3u8(result_url)
                     if cleaned_url:
@@ -70,18 +135,17 @@ class DecryptParser:
                     else:
                         return result_url
                 elif '.mp4' in result_url.lower():
-                    logger.info(f"解密方案解析成功（mp4）: {result_url[:100]}...")
-                    # mp4链接也可以直接使用，返回它
+                    logger.info(f"解密解析器: 解密方案解析成功（mp4）: {result_url[:100]}...")
+                    return result_url
                 else:
-                    logger.info(f"解密方案解析成功（其他格式）: {result_url[:100]}...")
-                
-                return result_url
+                    logger.info(f"解密解析器: 解密方案解析成功（其他格式）: {result_url[:100]}...")
+                    return result_url
             else:
-                logger.warning("解密方案解析失败")
+                logger.warning("解密解析器: 解密方案解析失败，无法从响应中提取视频链接")
                 return None
                 
         except Exception as e:
-            logger.error(f"解密方案解析异常: {e}")
+            logger.error(f"解密解析器: 解密方案解析异常: {e}")
             return None
     
     def _download_and_clean_m3u8(self, m3u8_url: str) -> Optional[str]:
