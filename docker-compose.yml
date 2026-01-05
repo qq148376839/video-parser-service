@@ -11,7 +11,7 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Asia/Shanghai
-      - API_BASE_URL=http://localhost:1233  # API服务的基础URL（用于生成m3u8访问链接）
+      - API_BASE_URL=http://192.168.31.18:1233  # API服务的基础URL（用于生成m3u8访问链接）
     healthcheck:
       test: ["CMD", "python", "/app/healthcheck.py"]
       interval: 30s

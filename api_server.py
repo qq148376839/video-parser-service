@@ -5,8 +5,9 @@ FastAPI主服务
 import time
 import os
 import threading
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response
 from typing import Optional, Dict
 from contextlib import asynccontextmanager
 from urllib.parse import unquote
@@ -677,14 +678,14 @@ async def search_videos(
 @app.get("/api/v1/m3u8/{file_id}")
 async def get_m3u8_file(file_id: str, request: Request):
     """
-    获取下载的m3u8文件内容
+    获取下载的m3u8文件内容或其他缓存文件（如enc.key）
     
     Args:
-        file_id: 文件ID（由2s0解析器或z参数解析器生成）
+        file_id: 文件ID（由2s0解析器或z参数解析器生成）或文件名（如enc.key）
         request: FastAPI请求对象
     
     Returns:
-        m3u8文件内容（text/plain格式）
+        文件内容（根据文件类型返回相应的Content-Type）
     """
     m3u8_file_path = None
     
@@ -696,8 +697,18 @@ async def get_m3u8_file(file_id: str, request: Request):
     if not m3u8_file_path and z_param_parser:
         m3u8_file_path = z_param_parser.get_m3u8_file_path(file_id)
     
+    # 如果通过解析器没有找到，尝试直接从m3u8_cache目录查找文件
     if not m3u8_file_path:
-        logger.warning(f"请求的m3u8文件不存在: file_id={file_id}")
+        project_root = Path(__file__).parent
+        cache_dir = project_root / "data" / "m3u8_cache"
+        # 尝试直接查找文件（支持文件名如enc.key）
+        direct_file_path = cache_dir / file_id
+        if direct_file_path.exists() and direct_file_path.is_file():
+            m3u8_file_path = str(direct_file_path)
+            logger.info(f"从m3u8_cache目录找到文件: {file_id}")
+    
+    if not m3u8_file_path:
+        logger.warning(f"请求的文件不存在: file_id={file_id}")
         return {
             "success": False,
             "data": {},
@@ -707,7 +718,7 @@ async def get_m3u8_file(file_id: str, request: Request):
     
     # 检查文件是否存在
     if not os.path.exists(m3u8_file_path):
-        logger.error(f"m3u8文件路径不存在: {m3u8_file_path}")
+        logger.error(f"文件路径不存在: {m3u8_file_path}")
         return {
             "success": False,
             "data": {},
@@ -716,28 +727,60 @@ async def get_m3u8_file(file_id: str, request: Request):
         }
     
     try:
-        # 读取文件内容
-        with open(m3u8_file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # 根据文件扩展名判断文件类型
+        file_path_obj = Path(m3u8_file_path)
+        file_ext = file_path_obj.suffix.lower()
         
-        logger.debug(f"返回m3u8文件: file_id={file_id}, 大小={len(content)} 字节")
+        # 判断是否为二进制文件（如.key文件）
+        binary_extensions = {'.key', '.bin', '.dat'}
+        is_binary = file_ext in binary_extensions
         
-        # 返回文件内容，设置正确的Content-Type
-        return PlainTextResponse(
-            content=content,
-            media_type="application/vnd.apple.mpegurl",
-            headers={
-                "Content-Disposition": f'inline; filename="{file_id}.m3u8"',
-                "Cache-Control": "no-cache"
+        if is_binary:
+            # 读取二进制文件
+            with open(m3u8_file_path, 'rb') as f:
+                content = f.read()
+            
+            logger.debug(f"返回二进制文件: file_id={file_id}, 大小={len(content)} 字节")
+            
+            # 根据文件扩展名设置Content-Type
+            content_type_map = {
+                '.key': 'application/octet-stream',
+                '.bin': 'application/octet-stream',
+                '.dat': 'application/octet-stream'
             }
-        )
+            content_type = content_type_map.get(file_ext, 'application/octet-stream')
+            
+            return Response(
+                content=content,
+                media_type=content_type,
+                headers={
+                    "Content-Disposition": f'inline; filename="{file_id}"',
+                    "Cache-Control": "no-cache"
+                }
+            )
+        else:
+            # 读取文本文件（m3u8文件）
+            with open(m3u8_file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            logger.debug(f"返回m3u8文件: file_id={file_id}, 大小={len(content)} 字节")
+            
+            # 返回文件内容，设置正确的Content-Type
+            return PlainTextResponse(
+                content=content,
+                media_type="application/vnd.apple.mpegurl",
+                headers={
+                    "Content-Disposition": f'inline; filename="{file_id}"',
+                    "Cache-Control": "no-cache"
+                }
+            )
     except Exception as e:
-        logger.error(f"读取m3u8文件失败: {e}", exc_info=True)
+        logger.error(f"读取文件失败: {e}", exc_info=True)
         return {
             "success": False,
             "data": {},
             "fallback_used": False,
-            "error": f"读取m3u8文件失败: {str(e)}"
+            "error": f"读取文件失败: {str(e)}"
         }
 
 
