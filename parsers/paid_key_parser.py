@@ -21,6 +21,7 @@ from pathlib import Path
 from utils.logger import logger
 from utils.file_lock import FileLock
 from utils.m3u8_cleaner import M3U8Cleaner
+from utils.database import get_database
 
 
 class PaidKeyM3U8Getter:
@@ -61,36 +62,113 @@ class PaidKeyM3U8Getter:
         self.current_key = None
     
     def load_keys(self) -> Dict:
-        """加载key信息（使用文件锁）"""
-        json_path = Path(self.json_file)
-        if not json_path.exists():
-            raise FileNotFoundError(f"JSON文件不存在: {self.json_file}")
-        
+        """加载key信息（从数据库读取）"""
         try:
-            with FileLock.lock_file(json_path, timeout=5.0) as f:
-                data = json.load(f)
+            db = get_database()
+            
+            # 从数据库加载keys
+            keys_records = db.execute_query(
+                """
+                SELECT email, password, uid, "key", register_time, expire_date
+                FROM registrations
+                WHERE is_active = 1
+                ORDER BY id
+                """
+            )
+            
+            # 转换为列表格式
+            keys = []
+            for record in keys_records:
+                keys.append({
+                    'email': record['email'],
+                    'password': record['password'],
+                    'uid': record['uid'],
+                    'key': record['key'],
+                    'register_time': record['register_time'],
+                    'expire_date': record['expire_date']
+                })
+            
+            # 获取current_index
+            config = db.execute_one(
+                "SELECT config_value FROM registration_config WHERE config_key = 'current_index'"
+            )
+            current_index = int(config['config_value']) if config else 0
+            
+            # 构建返回数据（兼容旧格式）
+            data = {
+                'current_index': current_index,
+                'keys': keys
+            }
+            
             return data
-        except TimeoutError:
-            logger.warning(f"2s0解析器: 获取JSON文件锁超时，尝试直接读取")
-            # 超时后尝试直接读取（可能其他进程已释放锁）
-            with open(self.json_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return data
+            
+        except Exception as e:
+            logger.error(f"2s0解析器: 从数据库加载key信息失败: {e}", exc_info=True)
+            # 降级到JSON文件（如果存在）
+            json_path = Path(self.json_file)
+            if json_path.exists():
+                logger.warning("降级到JSON文件读取")
+                try:
+                    with FileLock.lock_file(json_path, timeout=5.0) as f:
+                        data = json.load(f)
+                    return data
+                except Exception as json_e:
+                    logger.error(f"读取JSON文件也失败: {json_e}")
+            raise FileNotFoundError(f"无法加载key信息: {e}")
     
     def save_keys(self, data: Dict) -> None:
-        """保存key信息（使用文件锁）"""
-        json_path = Path(self.json_file)
+        """保存key信息（保存到数据库）"""
         try:
-            with FileLock.lock_file(json_path, timeout=5.0) as f:
-                # 重新读取以确保使用最新数据
-                f.seek(0)
-                f.truncate(0)
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except TimeoutError:
-            logger.warning(f"2s0解析器: 保存JSON文件锁超时，尝试直接写入")
-            # 超时后尝试直接写入
-            with open(self.json_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            db = get_database()
+            
+            # 保存current_index
+            current_index = data.get('current_index', 0)
+            db.execute_update(
+                """
+                INSERT OR REPLACE INTO registration_config (config_key, config_value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                """,
+                ('current_index', str(current_index))
+            )
+            
+            # 保存keys（更新现有记录）
+            keys = data.get('keys', [])
+            for key_info in keys:
+                email = key_info.get('email')
+                if not email:
+                    continue
+                
+                db.execute_update(
+                    """
+                    INSERT OR REPLACE INTO registrations 
+                    (email, password, uid, "key", register_time, expire_date, updated_at, is_active)
+                    VALUES (?, ?, ?, ?, ?, ?, datetime('now'), 1)
+                    """,
+                    (
+                        email,
+                        key_info.get('password', ''),
+                        key_info.get('uid'),
+                        key_info.get('key'),
+                        key_info.get('register_time'),
+                        key_info.get('expire_date')
+                    )
+                )
+            
+            logger.debug(f"2s0解析器: 已保存 {len(keys)} 个key到数据库")
+            
+        except Exception as e:
+            logger.error(f"2s0解析器: 保存key信息到数据库失败: {e}", exc_info=True)
+            # 降级到JSON文件（如果文件路径存在）
+            json_path = Path(self.json_file)
+            if json_path.parent.exists():
+                logger.warning("降级到JSON文件保存")
+                try:
+                    with FileLock.lock_file(json_path, timeout=5.0) as f:
+                        f.seek(0)
+                        f.truncate(0)
+                        json.dump(data, f, indent=2, ensure_ascii=False)
+                except Exception as json_e:
+                    logger.error(f"保存JSON文件也失败: {json_e}")
     
     def update_json_structure(self, keys: List[Dict]) -> tuple:
         """更新JSON结构，添加expire_date字段"""
@@ -397,7 +475,33 @@ class PaidKeyParser:
         self.api_base_url = api_base_url.rstrip('/')
         # 存储m3u8文件路径的映射 {file_id: file_path}
         self.m3u8_files = {}
+        # 存储取消事件 {video_url: threading.Event}
+        self._cancellation_events = {}
         logger.info("2s0解析器初始化完成")
+    
+    def set_cancellation_event(self, video_url: str, event):
+        """
+        设置取消事件，用于中断解析
+        
+        Args:
+            video_url: 视频URL
+            event: threading.Event对象
+        """
+        self._cancellation_events[video_url] = event
+    
+    def _is_cancelled(self, video_url: str) -> bool:
+        """
+        检查是否已取消
+        
+        Args:
+            video_url: 视频URL
+        
+        Returns:
+            是否已取消
+        """
+        if video_url in self._cancellation_events:
+            return self._cancellation_events[video_url].is_set()
+        return False
     
     def _generate_file_id(self, m3u8_url: str) -> str:
         """
@@ -448,6 +552,11 @@ class PaidKeyParser:
         
         # 重试机制：最多重试max_retries次
         for attempt in range(max_retries + 1):  # 0, 1, 2 共3次（首次+2次重试）
+            # 检查是否已取消
+            if self._is_cancelled(video_url):
+                logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                return None
+            
             try:
                 if attempt > 0:
                     logger.info(f"2s0解析器: 第{attempt}次重试解析: {video_url[:100]}...")
@@ -457,7 +566,16 @@ class PaidKeyParser:
                 # 调用getter获取m3u8 URL（内部已有key轮询重试机制）
                 m3u8_url = self.getter.get_m3u8_url(video_url, retry=True)
                 
+                # 再次检查是否已取消（在获取URL后）
+                if self._is_cancelled(video_url):
+                    logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                    return None
+                
                 if not m3u8_url:
+                    # 检查是否已取消
+                    if self._is_cancelled(video_url):
+                        logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                        return None
                     if attempt < max_retries:
                         logger.warning(f"2s0解析器: 第{attempt+1}次尝试失败，准备重试...")
                         continue
@@ -467,10 +585,19 @@ class PaidKeyParser:
                 
                 logger.info(f"2s0解析器: 获取到m3u8 URL: {m3u8_url[:100]}...")
                 
+                # 检查是否已取消（在下载前）
+                if self._is_cancelled(video_url):
+                    logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                    return None
+                
                 # 下载m3u8文件
                 m3u8_file_path = self.getter.download_m3u8_file(m3u8_url)
                 
                 if not m3u8_file_path:
+                    # 检查是否已取消
+                    if self._is_cancelled(video_url):
+                        logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                        return None
                     if attempt < max_retries:
                         logger.warning(f"2s0解析器: 第{attempt+1}次尝试下载m3u8文件失败，准备重试...")
                         continue
@@ -492,6 +619,10 @@ class PaidKeyParser:
                 return local_api_url
                     
             except Exception as e:
+                # 检查是否已取消
+                if self._is_cancelled(video_url):
+                    logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
+                    return None
                 if attempt < max_retries:
                     logger.warning(f"2s0解析器: 第{attempt+1}次尝试异常: {e}，准备重试...")
                     continue

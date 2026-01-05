@@ -9,7 +9,7 @@ import asyncio
 import os
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from utils.logger import logger
 from utils.z_param_manager import z_param_manager
 from utils.m3u8_cleaner import M3U8Cleaner
@@ -24,8 +24,13 @@ _playwright_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pla
 class ZParamParser:
     """z参数解析器（主要方案）"""
     
-    def __init__(self):
-        """初始化z参数解析器"""
+    def __init__(self, api_base_url: str = "http://localhost:8000"):
+        """
+        初始化z参数解析器
+        
+        Args:
+            api_base_url: API服务的基础URL，用于生成m3u8文件的访问链接
+        """
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
@@ -36,6 +41,9 @@ class ZParamParser:
             'Referer': 'https://m1-z2.cloud.nnpp.vip:2223/',
             'Origin': 'https://m1-z2.cloud.nnpp.vip:2223',
         })
+        self.api_base_url = api_base_url.rstrip('/')
+        # 存储m3u8文件路径的映射 {file_id: file_path}
+        self.m3u8_files = {}
         logger.info("z参数解析器初始化完成")
     
     def construct_api_url(self, video_url: str) -> Optional[str]:
@@ -60,7 +68,7 @@ class ZParamParser:
         logger.debug(f"构造API URL: {api_url[:100]}...")
         return api_url
     
-    def call_api(self, api_url: str) -> Optional[Dict]:
+    def call_api(self, api_url: str) -> Tuple[Optional[Dict], bool]:
         """
         调用API获取视频信息
         
@@ -68,7 +76,10 @@ class ZParamParser:
             api_url: API URL
         
         Returns:
-            API响应数据，如果失败返回None
+            (API响应数据, 是否是z参数过期) 元组
+            如果失败且是z参数过期，返回(None, True)
+            如果失败但不是z参数过期，返回(None, False)
+            如果成功，返回(响应数据, False)
         """
         try:
             # 移除Accept-Encoding避免压缩问题
@@ -80,20 +91,20 @@ class ZParamParser:
             
             if response.status_code != 200:
                 logger.warning(f"API返回非200状态码: {response.status_code}")
-                return None
+                return None, False
             
             # 处理响应内容
             content = response.text
             
-            # 检查是否是错误信息
+            # 检查是否是错误信息（z参数过期）
             if '联系QQ' in content or '获取json版api地址' in content:
                 logger.warning("API返回错误信息，z参数可能已过期")
-                return None
+                return None, True
             
             # 尝试解析JSON
             try:
                 json_data = json.loads(content)
-                return json_data
+                return json_data, False
             except json.JSONDecodeError:
                 # 尝试从响应中提取m3u8链接
                 m3u8_patterns = [
@@ -107,14 +118,14 @@ class ZParamParser:
                         url = match if isinstance(match, str) else match[0] if match else None
                         if url and url.startswith('http'):
                             logger.info(f"从响应中提取到m3u8链接: {url[:100]}...")
-                            return {'m3u8_url': url}
+                            return {'m3u8_url': url}, False
                 
                 logger.warning("无法解析API响应")
-                return None
+                return None, False
                 
         except Exception as e:
             logger.error(f"调用API失败: {e}")
-            return None
+            return None, False
     
     def extract_m3u8(self, api_response: Dict) -> Optional[str]:
         """
@@ -207,10 +218,45 @@ class ZParamParser:
                 return None
             
             # 调用API
-            api_response = self.call_api(api_url)
+            api_response, is_expired = self.call_api(api_url)
             if not api_response:
-                logger.warning("API调用失败")
-                return None
+                # 如果检测到z参数过期，尝试更新并重试一次
+                if is_expired:
+                    logger.info("检测到z参数已过期，尝试更新并重试...")
+                    # 先尝试HTTP方式（快速）
+                    new_z = z_param_manager.update_with_http(video_url)
+                    # 如果HTTP方式失败，尝试Playwright方式（需要浏览器）
+                    if not new_z:
+                        logger.info("HTTP方式失败，尝试Playwright方式...")
+                        try:
+                            future = _playwright_executor.submit(z_param_manager.update_with_playwright, video_url)
+                            new_z = future.result(timeout=60)  # 最多等待60秒
+                        except Exception as e:
+                            logger.error(f"Playwright线程执行失败: {e}", exc_info=True)
+                            new_z = None
+                    
+                    if new_z:
+                        logger.info("z参数更新成功，重新调用API...")
+                        # 重新构造API URL
+                        api_url = self.construct_api_url(video_url)
+                        if api_url:
+                            # 重新调用API
+                            api_response, is_expired_retry = self.call_api(api_url)
+                            if not api_response:
+                                if is_expired_retry:
+                                    logger.warning("z参数更新后API仍然返回过期错误")
+                                else:
+                                    logger.warning("z参数更新后API调用仍然失败")
+                                return None
+                        else:
+                            logger.error("z参数更新后无法构造API URL")
+                            return None
+                    else:
+                        logger.warning("z参数更新失败，API调用失败")
+                        return None
+                else:
+                    logger.warning("API调用失败（非z参数过期原因）")
+                    return None
             
             # 提取m3u8链接
             m3u8_url = self.extract_m3u8(api_response)
@@ -233,24 +279,48 @@ class ZParamParser:
             logger.error(f"z参数方案解析异常: {e}")
             return None
     
+    def _generate_file_id(self, m3u8_url: str) -> str:
+        """
+        生成文件ID（基于m3u8 URL的hash）
+        注意：文件ID需要与文件名中的hash部分匹配
+        """
+        import hashlib
+        # 从URL提取hash（如果存在）
+        hash_match = re.search(r'/Cache/[^/]+/([a-f0-9]+)\.m3u8', m3u8_url)
+        if hash_match:
+            # 使用URL中的hash（32位十六进制）
+            return hash_match.group(1)[:16]  # 取前16位
+        else:
+            # 如果没有hash，使用MD5
+            hash_obj = hashlib.md5(m3u8_url.encode('utf-8'))
+            return hash_obj.hexdigest()[:16]
+    
     def _download_and_clean_m3u8(self, m3u8_url: str) -> Optional[str]:
         """
-        下载m3u8文件并清理，返回清理后的文件路径或原始URL
+        下载m3u8文件并清理，返回API接口URL
         
-        如果相同hash的文件已存在，直接返回现有文件，避免重复下载
+        如果相同hash的文件已存在，直接返回现有文件的API接口URL，避免重复下载
+        
+        支持master playlist重定向：如果下载的m3u8文件是master playlist（包含#EXT-X-STREAM-INF），
+        会自动提取其中的相对路径并下载最终的m3u8文件。
         
         Args:
             m3u8_url: m3u8 URL
         
         Returns:
-            清理后的m3u8文件路径（如果成功），否则返回原始URL
+            API接口URL（如果成功），否则返回None
         """
+        from urllib.parse import urljoin, urlparse
+        
         # 保存到缓存目录
         cache_dir = project_root / "data" / "m3u8_cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         
         # 从URL提取hash
         hash_match = re.search(r'/Cache/[^/]+/([a-f0-9]+)\.m3u8', m3u8_url)
+        
+        # 生成文件ID（基于原始URL）
+        file_id = self._generate_file_id(m3u8_url)
         
         # 检查是否已有相同hash的文件存在
         if hash_match:
@@ -261,13 +331,65 @@ class ZParamParser:
                 # 使用最新的文件（按修改时间）
                 latest_file = max(existing_files, key=lambda p: p.stat().st_mtime)
                 logger.info(f"z参数解析器: 发现已存在的m3u8文件（hash={hash_value}），使用缓存: {latest_file}")
-                return str(latest_file)
+                # 存储文件映射
+                self.m3u8_files[file_id] = str(latest_file)
+                # 返回API接口URL
+                return f"{self.api_base_url}/api/v1/m3u8/{file_id}"
         
         try:
             # 下载m3u8文件
             response = self.session.get(m3u8_url, timeout=30)
             response.raise_for_status()
             m3u8_content = response.text
+            
+            # 检查是否是master playlist（包含#EXT-X-STREAM-INF）
+            if '#EXT-X-STREAM-INF' in m3u8_content:
+                logger.info(f"z参数解析器: 检测到master playlist，提取最终m3u8地址...")
+                
+                # 解析master playlist，提取相对路径
+                lines = m3u8_content.split('\n')
+                final_m3u8_path = None
+                
+                for i, line in enumerate(lines):
+                    line_stripped = line.strip()
+                    # 查找#EXT-X-STREAM-INF后面的URL行
+                    if line_stripped.startswith('#EXT-X-STREAM-INF'):
+                        # 下一行应该是URL（相对路径或绝对路径）
+                        if i + 1 < len(lines):
+                            next_line = lines[i + 1].strip()
+                            if next_line and not next_line.startswith('#'):
+                                final_m3u8_path = next_line
+                                break
+                
+                if final_m3u8_path:
+                    # 如果是相对路径，转换为绝对URL
+                    if not final_m3u8_path.startswith(('http://', 'https://')):
+                        # 基于原始m3u8_url构建绝对URL（urljoin会自动处理相对路径）
+                        final_m3u8_url = urljoin(m3u8_url, final_m3u8_path)
+                        logger.info(f"z参数解析器: 将相对路径转换为绝对URL: {final_m3u8_url}")
+                    else:
+                        final_m3u8_url = final_m3u8_path
+                    
+                    # 递归下载最终的m3u8文件（使用最终的URL）
+                    # 注意：这里需要更新file_id和hash_match，因为最终的URL可能不同
+                    final_hash_match = re.search(r'/Cache/[^/]+/([a-f0-9]+)\.m3u8', final_m3u8_url)
+                    if final_hash_match:
+                        # 使用最终URL的hash
+                        final_hash_value = final_hash_match.group(1)
+                        existing_files = list(cache_dir.glob(f"m3u8_{final_hash_value}_*.m3u8"))
+                        if existing_files:
+                            latest_file = max(existing_files, key=lambda p: p.stat().st_mtime)
+                            logger.info(f"z参数解析器: 发现已存在的最终m3u8文件（hash={final_hash_value}），使用缓存: {latest_file}")
+                            self.m3u8_files[file_id] = str(latest_file)
+                            return f"{self.api_base_url}/api/v1/m3u8/{file_id}"
+                    
+                    # 下载最终的m3u8文件
+                    logger.info(f"z参数解析器: 下载最终的m3u8文件: {final_m3u8_url[:100]}...")
+                    final_response = self.session.get(final_m3u8_url, timeout=30)
+                    final_response.raise_for_status()
+                    m3u8_content = final_response.text
+                else:
+                    logger.warning(f"z参数解析器: 无法从master playlist中提取m3u8路径")
             
             # 清理m3u8内容
             cleaned_content = M3U8Cleaner.clean_m3u8_content(m3u8_content)
@@ -290,10 +412,54 @@ class ZParamParser:
             
             logger.info(f"z参数解析器: m3u8文件已下载并清理: {output_path}")
             
-            # 返回文件路径（可以作为URL使用，或者通过API接口提供）
-            return str(output_path)
+            # 存储文件映射
+            self.m3u8_files[file_id] = str(output_path)
+            
+            # 返回API接口URL
+            return f"{self.api_base_url}/api/v1/m3u8/{file_id}"
             
         except Exception as e:
             logger.warning(f"z参数解析器: 下载m3u8文件失败: {e}，返回原始URL")
             return None
+    
+    def get_m3u8_file_path(self, file_id: str) -> Optional[str]:
+        """
+        根据文件ID获取m3u8文件路径（支持从内存映射和文件系统查找）
+        
+        Args:
+            file_id: 文件ID（16位hash）
+        
+        Returns:
+            m3u8文件路径，如果不存在返回None
+        """
+        # 首先从内存映射中查找
+        if file_id in self.m3u8_files:
+            file_path = self.m3u8_files[file_id]
+            if os.path.exists(file_path):
+                return file_path
+            else:
+                # 文件不存在，从映射中移除
+                del self.m3u8_files[file_id]
+        
+        # 从文件系统查找（基于文件ID的前缀匹配）
+        cache_dir = project_root / "data" / "m3u8_cache"
+        if cache_dir.exists():
+            # 文件名格式：m3u8_{hash}_{timestamp}.m3u8
+            # 查找hash部分以file_id开头的文件（file_id是hash的前16位）
+            for file_path in cache_dir.glob("m3u8_*.m3u8"):
+                file_name = file_path.stem  # 不含扩展名
+                # 提取hash部分（m3u8_后面的部分，直到第一个下划线）
+                parts = file_name.split('_')
+                if len(parts) >= 2:
+                    hash_part = parts[1]  # hash部分
+                    # 检查hash的前16位是否匹配file_id
+                    if hash_part.startswith(file_id):
+                        if file_path.exists():
+                            # 更新映射
+                            self.m3u8_files[file_id] = str(file_path)
+                            logger.debug(f"从文件系统找到m3u8文件: {file_id} -> {file_path}")
+                            return str(file_path)
+        
+        logger.warning(f"未找到m3u8文件: file_id={file_id}")
+        return None
 

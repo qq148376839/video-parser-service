@@ -38,6 +38,11 @@ data/logs/
 
 # 缓存文件
 data/m3u8_cache/*.m3u8
+# 但必须包含 enc.key（用于解密 m3u8 数据）
+!data/m3u8_cache/enc.key
+
+# 备份文件
+data/backups/
 
 # 调试文件
 *.html

@@ -17,6 +17,7 @@ sys.path.insert(0, str(project_root))
 
 from utils.logger import logger
 from utils.config_loader import config_loader
+from utils.search_cache import get_search_cache
 from .paid_key_parser import PaidKeyParser
 from .z_param_parser import ZParamParser
 from .decrypt_parser import DecryptParser
@@ -25,11 +26,17 @@ from .decrypt_parser import DecryptParser
 class SearchParser:
     """资源检索解析器"""
     
-    def __init__(self):
-        """初始化资源检索解析器"""
-        self.paid_key_parser = PaidKeyParser()
-        self.z_param_parser = ZParamParser()
+    def __init__(self, api_base_url: str = "http://localhost:8000"):
+        """
+        初始化资源检索解析器
+        
+        Args:
+            api_base_url: API服务的基础URL，用于生成m3u8文件的访问链接
+        """
+        self.paid_key_parser = PaidKeyParser(api_base_url=api_base_url)
+        self.z_param_parser = ZParamParser(api_base_url=api_base_url)
         self.decrypt_parser = DecryptParser()
+        self.search_cache = get_search_cache()
         logger.info("资源检索解析器初始化完成")
     
     def search_api_sites(self, keyword: str) -> List[Dict]:
@@ -178,6 +185,46 @@ class SearchParser:
             
             # 格式：正片$url 或 平台名$url 或 正片$url1$url2$url3（多集）
             # 或：正片$1$url1#2$url2#3$url3（带集标识符）
+            # 或：1$url1#2$url2#3$url3（直接以集数开头，无"正片$"前缀）
+            
+            # 首先检查是否是直接以集数开头的格式：1$url1#2$url2...
+            if part[0].isdigit() and '#' in part:
+                # 直接以集数开头的格式：1$url1#2$url2#3$url3
+                episode_pairs = []
+                episode_parts = part.split('#')
+                
+                for ep_part in episode_parts:
+                    ep_part = ep_part.strip()
+                    if not ep_part or '$' not in ep_part:
+                        continue
+                    
+                    # 分割集标识符和URL
+                    ep_split = ep_part.split('$', 1)
+                    if len(ep_split) == 2:
+                        episode_label = ep_split[0].strip()
+                        episode_url = ep_split[1].strip()
+                        
+                        # 验证URL格式
+                        if episode_url.startswith(('http://', 'https://')):
+                            episode_pairs.append((episode_label, episode_url))
+                
+                if episode_pairs:
+                    # 识别平台（使用第一个URL）
+                    first_url = episode_pairs[0][1]
+                    platform = self.identify_platform(first_url)
+                    if platform:
+                        # 存储为元组列表，保留集标识符
+                        if platform not in urls:
+                            urls[platform] = episode_pairs
+                        else:
+                            # 合并（去重URL）
+                            existing_urls = {url for _, url in urls[platform]}
+                            new_pairs = [(label, url) for label, url in episode_pairs if url not in existing_urls]
+                            if new_pairs:
+                                urls[platform].extend(new_pairs)
+                        logger.info(f"检测到多集URL（带集标识符，直接以集数开头），共 {len(episode_pairs)} 集")
+                    continue
+            
             parts_split = part.split('$', 1)  # 只分割第一个$，保留后续部分
             if len(parts_split) < 2:
                 continue
@@ -188,7 +235,7 @@ class SearchParser:
             # 检查是否包含带集标识符的格式：[集数或集名]$[URL]#[集数或集名]$[URL]#...
             # 使用#作为集之间的分隔符
             if '#' in url_content:
-                # 带集标识符格式：1$url1#2$url2#3$url3
+                # 带集标识符格式：正片$1$url1#2$url2#3$url3 或 平台名$1$url1#2$url2#3$url3
                 episode_pairs = []
                 episode_parts = url_content.split('#')
                 
@@ -386,13 +433,15 @@ class SearchParser:
                         unique_pairs.append((label, url))
                 
                 if unique_pairs:
-                    # 格式：正片$label1$url1#label2$url2#label3$url3
+                    # 格式：label1$url1#label2$url2#label3$url3（保持原始格式，不使用"正片$"前缀）
                     episode_strs = [f"{label}${url}" for label, url in unique_pairs]
                     if len(episode_strs) == 1:
-                        parts.append(f"正片${episode_strs[0]}")
+                        # 单集时也保持格式：label$url
+                        parts.append(episode_strs[0])
                     else:
+                        # 多集格式：label1$url1#label2$url2#label3$url3
                         episode_str = '#'.join(episode_strs)
-                        parts.append(f"正片${episode_str}")
+                        parts.append(episode_str)
             elif isinstance(url_value, list):
                 # 多集URL：正片$url1$url2$url3
                 # 对列表中的URL也进行去重
@@ -569,7 +618,7 @@ class SearchParser:
     
     def search_and_parse(self, keyword: str, parser_url: str = "https://jx.789jiexi.com") -> Dict:
         """
-        搜索资源并解析视频地址
+        搜索资源并解析视频地址（集成缓存）
         
         Args:
             keyword: 搜索关键词
@@ -580,11 +629,18 @@ class SearchParser:
         """
         logger.info(f"搜索资源: {keyword}")
         
-        # 1. 搜索所有API站点
+        # 1. 检查缓存
+        cached_results = self.search_cache.get_cache(keyword)
+        
+        # 2. 搜索所有API站点（获取最新搜索结果）
         all_results = self.search_api_sites(keyword)
         
         if not all_results:
             logger.warning("所有API站点都无结果")
+            # 如果有缓存，返回缓存
+            if cached_results:
+                logger.info("使用缓存结果（API站点无结果）")
+                return cached_results
             return {
                 "code": 1,
                 "msg": "数据列表",
@@ -595,11 +651,137 @@ class SearchParser:
                 "list": []
             }
         
-        # 2. 合并去重
+        # 3. 合并去重
         merged_list = self.merge_results(all_results)
         logger.info(f"合并后共 {len(merged_list)} 条资源")
         
-        # 3. 解析视频地址
+        # 4. 如果有缓存，进行增量更新
+        if cached_results:
+            logger.info("检测到缓存，进行增量更新检查...")
+            
+            # 合并缓存结果和新搜索结果
+            merged_results = self.search_cache.merge_results(cached_results, {
+                "code": 1,
+                "msg": "数据列表",
+                "page": 1,
+                "pagecount": 1,
+                "limit": 20,
+                "total": len(merged_list),
+                "list": merged_list
+            })
+            
+            # 检查是否有新增集数需要解析
+            needs_incremental_parse = False
+            items_to_parse = []
+            
+            for new_item in merged_list:
+                vod_name = new_item.get('vod_name')
+                if not vod_name:
+                    continue
+                
+                # 在缓存中查找对应项
+                cached_item = None
+                for cached_item_temp in cached_results.get('list', []):
+                    if cached_item_temp.get('vod_name') == vod_name:
+                        cached_item = cached_item_temp
+                        break
+                
+                if cached_item:
+                    # 比较是否有新增集数
+                    comparison = self.search_cache.compare_and_get_new_episodes(
+                        cached_item, new_item
+                    )
+                    if comparison['has_new']:
+                        needs_incremental_parse = True
+                        # 只解析新增的URL
+                        items_to_parse.append({
+                            'item': new_item,
+                            'cached_item': cached_item,
+                            'new_urls': comparison['new_urls'],
+                            'new_count': comparison['new_count']
+                        })
+                        logger.info(f"资源 [{vod_name}] 有新增 {comparison['new_count']} 集，需要增量解析")
+                else:
+                    # 新资源，需要完整解析
+                    needs_incremental_parse = True
+                    items_to_parse.append({
+                        'item': new_item,
+                        'cached_item': None,
+                        'new_urls': None,  # None表示完整解析
+                        'new_count': 0
+                    })
+            
+            # 如果没有新增，直接返回缓存
+            if not needs_incremental_parse:
+                logger.info("缓存命中：无新增集数，直接返回缓存")
+                return cached_results
+            
+            # 执行增量解析
+            logger.info(f"执行增量更新：共 {len(items_to_parse)} 项需要解析")
+            parsed_list = []
+            
+            # 先添加缓存中已有的项（不需要解析的）
+            cached_map = {item.get('vod_name'): item for item in cached_results.get('list', [])}
+            for new_item in merged_list:
+                vod_name = new_item.get('vod_name')
+                if not vod_name:
+                    continue
+                
+                # 检查是否需要解析
+                needs_parse = any(
+                    parse_info['item'].get('vod_name') == vod_name 
+                    for parse_info in items_to_parse
+                )
+                
+                if not needs_parse and vod_name in cached_map:
+                    # 使用缓存项
+                    parsed_list.append(cached_map[vod_name])
+            
+            # 解析需要更新的项
+            for parse_info in items_to_parse:
+                item = parse_info['item']
+                cached_item = parse_info['cached_item']
+                new_urls = parse_info['new_urls']
+                
+                play_url = item.get('vod_play_url', '')
+                if not play_url:
+                    continue
+                
+                if new_urls is None:
+                    # 完整解析（新资源）
+                    parsed_play_url = self.parse_video_urls(play_url, parser_url)
+                else:
+                    # 增量解析（只解析新增的URL）
+                    parsed_play_url = self._parse_incremental_urls(
+                        cached_item, item, new_urls, parser_url
+                    )
+                
+                if parsed_play_url and parsed_play_url.strip():
+                    item['vod_play_url'] = parsed_play_url
+                    parsed_list.append(item)
+                elif cached_item:
+                    # 解析失败，使用缓存项
+                    parsed_list.append(cached_item)
+            
+            # 构建最终结果
+            final_results = {
+                "code": 1,
+                "msg": "数据列表",
+                "page": 1,
+                "pagecount": 1,
+                "limit": 20,
+                "total": len(parsed_list),
+                "list": parsed_list
+            }
+            
+            # 保存到缓存
+            self.search_cache.set_cache(keyword, final_results)
+            logger.info(f"增量更新完成，共 {len(parsed_list)} 条资源")
+            
+            return final_results
+        
+        # 5. 无缓存，执行完整搜索和解析流程
+        logger.info("缓存未命中，执行完整搜索和解析流程")
         parsed_list = []
         for item in merged_list:
             play_url = item.get('vod_play_url', '')
@@ -633,7 +815,7 @@ class SearchParser:
                 "list": []
             }
         
-        return {
+        final_results = {
             "code": 1,
             "msg": "数据列表",
             "page": 1,
@@ -642,4 +824,150 @@ class SearchParser:
             "total": len(parsed_list),
             "list": parsed_list
         }
+        
+        # 保存到缓存
+        self.search_cache.set_cache(keyword, final_results)
+        
+        return final_results
+    
+    def _parse_incremental_urls(self, cached_item: Dict, new_item: Dict, 
+                                new_urls: List[str], parser_url: str) -> str:
+        """
+        增量解析：只解析新增的URL，合并到缓存结果（使用并发解析）
+        
+        Args:
+            cached_item: 缓存中的视频项
+            new_item: 新搜索到的视频项
+            new_urls: 新增的URL列表
+            parser_url: 解析网站URL
+        
+        Returns:
+            合并后的vod_play_url字符串
+        """
+        # 获取缓存中已解析的URL
+        cached_play_url = cached_item.get('vod_play_url', '')
+        cached_urls_dict = self.parse_play_urls(cached_play_url)
+        
+        # 获取新搜索项的原始URL结构（用于提取集标识符）
+        new_play_url = new_item.get('vod_play_url', '')
+        new_urls_dict = self.parse_play_urls(new_play_url)
+        
+        if not new_urls:
+            logger.warning("增量解析：新增URL列表为空")
+            return cached_play_url
+        
+        # 识别平台（使用第一个URL识别，假设所有新增URL都是同一平台）
+        first_url = new_urls[0]
+        platform = self.identify_platform(first_url)
+        if not platform:
+            logger.warning(f"增量解析：无法识别平台，URL: {first_url[:50]}...")
+            return cached_play_url
+        
+        logger.info(f"增量解析：开始并发解析 {len(new_urls)} 个新增URL（平台: {platform}）")
+        
+        # 使用并发解析方法（复用现有的并发解析逻辑）
+        parsed_episodes = self._parse_episodes_parallel(platform, new_urls, parser_url)
+        
+        if not parsed_episodes:
+            logger.warning("增量解析：所有新增URL解析失败")
+            return cached_play_url
+        
+        logger.info(f"增量解析：成功解析 {len(parsed_episodes)}/{len(new_urls)} 个新增URL")
+        
+        # 检查新搜索项是否有集标识符格式
+        has_episode_labels = False
+        episode_labels = None
+        new_platform_data = None
+        
+        if platform in new_urls_dict:
+            new_platform_data = new_urls_dict[platform]
+            if isinstance(new_platform_data, list) and new_platform_data and isinstance(new_platform_data[0], tuple):
+                # 新搜索项有集标识符格式
+                has_episode_labels = True
+                # 计算缓存中已有的集数
+                cached_count = 0
+                if platform in cached_urls_dict:
+                    cached_data = cached_urls_dict[platform]
+                    if isinstance(cached_data, list) and cached_data and isinstance(cached_data[0], tuple):
+                        cached_count = len(cached_data)
+                    elif isinstance(cached_data, list):
+                        cached_count = len(cached_data)
+                    elif cached_data:
+                        cached_count = 1
+                
+                # 获取新增部分的集标识符（从cached_count开始）
+                episode_labels = [label for label, _ in new_platform_data[cached_count:cached_count + len(new_urls)]]
+        
+        # 合并到缓存URL字典
+        if platform not in cached_urls_dict:
+            cached_urls_dict[platform] = []
+        
+        # 获取缓存中该平台已有的数据
+        existing_data = cached_urls_dict[platform]
+        
+        # 优先使用新搜索项的集标识符格式（如果有）
+        if has_episode_labels:
+            # 新搜索项有集标识符格式，合并时保持格式
+            if isinstance(existing_data, list) and existing_data and isinstance(existing_data[0], tuple):
+                # 缓存也是带集标识符的格式，直接合并
+                existing_pairs = existing_data.copy()
+                existing_url_set = {url for _, url in existing_pairs}
+            else:
+                # 缓存是标准格式，需要转换为带集标识符格式
+                existing_pairs = []
+                existing_url_set = set()
+                
+                # 将缓存中的URL转换为带集标识符格式（使用新搜索项的集标识符）
+                if isinstance(existing_data, list):
+                    if existing_data and isinstance(existing_data[0], tuple):
+                        existing_pairs = existing_data.copy()
+                        existing_url_set = {url for _, url in existing_pairs}
+                    else:
+                        # 标准列表格式，需要从新搜索项获取集标识符
+                        for i, url in enumerate(existing_data):
+                            if i < len(new_platform_data):
+                                label = new_platform_data[i][0]
+                                existing_pairs.append((label, url))
+                                existing_url_set.add(url)
+                elif existing_data:
+                    # 单个URL
+                    if len(new_platform_data) > 0:
+                        label = new_platform_data[0][0]
+                        existing_pairs.append((label, existing_data))
+                        existing_url_set.add(existing_data)
+            
+            # 添加新增的解析结果（带集标识符）
+            for i, m3u8_url in enumerate(parsed_episodes):
+                if m3u8_url and m3u8_url not in existing_url_set:
+                    label = episode_labels[i] if i < len(episode_labels) else str(len(existing_pairs) + 1)
+                    existing_pairs.append((label, m3u8_url))
+                    existing_url_set.add(m3u8_url)
+            
+            cached_urls_dict[platform] = existing_pairs
+        else:
+            # 新搜索项没有集标识符格式，使用标准格式
+            existing_urls = []
+            if isinstance(existing_data, list):
+                if existing_data and isinstance(existing_data[0], tuple):
+                    existing_urls = [url for _, url in existing_data]
+                else:
+                    existing_urls = existing_data
+            elif existing_data:
+                existing_urls = [existing_data]
+            
+            # 合并新增的解析结果（去重）
+            existing_url_set = set(existing_urls)
+            for m3u8_url in parsed_episodes:
+                if m3u8_url and m3u8_url not in existing_url_set:
+                    existing_urls.append(m3u8_url)
+                    existing_url_set.add(m3u8_url)
+            
+            # 更新字典
+            if len(existing_urls) == 1:
+                cached_urls_dict[platform] = existing_urls[0]
+            else:
+                cached_urls_dict[platform] = existing_urls
+        
+        # 格式化返回
+        return self.format_play_urls(cached_urls_dict)
 

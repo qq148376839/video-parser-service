@@ -10,6 +10,7 @@ from typing import Optional, Dict
 from datetime import datetime, timedelta
 from .logger import logger
 from .file_lock import FileLock
+from .database import get_database
 
 # 数据目录
 DATA_DIR = Path("/app/data")
@@ -30,47 +31,95 @@ class ZParamManager:
     
     def load_params(self) -> Dict:
         """
-        从文件加载z参数（使用文件锁）
+        从数据库加载z参数（降级到JSON文件）
         
         Returns:
             z参数字典
         """
         try:
+            db = get_database()
+            
+            # 从数据库加载参数
+            params = {}
+            param_keys = ['z_param', 's1ig_param', 'g_param']
+            
+            for key in param_keys:
+                record = db.execute_one(
+                    "SELECT param_value, updated_at, expire_at FROM z_params_cache WHERE param_key = ?",
+                    (key,)
+                )
+                if record:
+                    params[key] = record['param_value']
+                    if key == 'z_param' and record.get('updated_at'):
+                        params['updated_at'] = record['updated_at']
+                    if record.get('expire_at'):
+                        params['expire_at'] = record['expire_at']
+            
+            # 设置默认值
+            if 's1ig_param' not in params:
+                params['s1ig_param'] = '11397'
+            if 'g_param' not in params:
+                params['g_param'] = ''
+            
+            # 计算expires_in（如果存在expire_at）
+            if 'expire_at' in params and 'updated_at' in params:
+                try:
+                    expire_at = datetime.fromisoformat(params['expire_at'])
+                    updated_at = datetime.fromisoformat(params['updated_at'])
+                    expires_in = int((expire_at - updated_at).total_seconds())
+                    params['expires_in'] = expires_in
+                except Exception:
+                    params['expires_in'] = 86400  # 默认24小时
+            
+            if params.get('z_param'):
+                self.z_params = params
+                logger.info("z参数从数据库加载成功")
+                return self.z_params
+            
+            # 如果数据库中没有，尝试从JSON文件加载（降级）
+            logger.debug("数据库中没有z参数，尝试从JSON文件加载")
             if Z_PARAMS_FILE.exists():
                 try:
                     with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
                         self.z_params = json.load(f)
-                    logger.info("z参数加载成功")
+                    logger.info("z参数从JSON文件加载成功")
+                    # 同步到数据库
+                    if self.z_params.get('z_param'):
+                        self.save_params(
+                            self.z_params.get('z_param'),
+                            self.z_params.get('s1ig_param', '11397'),
+                            self.z_params.get('g_param', '')
+                        )
+                    return self.z_params
                 except TimeoutError:
                     logger.warning("z参数文件锁超时，尝试直接读取")
                     with open(Z_PARAMS_FILE, 'r', encoding='utf-8') as f:
                         self.z_params = json.load(f)
                     logger.info("z参数加载成功（直接读取）")
+                    return self.z_params
             else:
                 logger.warning("z参数文件不存在，将使用默认值或自动获取")
                 self.z_params = {}
-            return self.z_params
-        except json.JSONDecodeError as e:
-            logger.error(f"加载z参数失败（JSON解析错误）: {e}")
-            # JSON文件可能损坏，尝试备份并重置
-            try:
-                backup_file = Z_PARAMS_FILE.with_suffix('.json.bak')
-                if Z_PARAMS_FILE.exists():
-                    import shutil
-                    shutil.copy2(Z_PARAMS_FILE, backup_file)
-                    logger.warning(f"已备份损坏的z参数文件到: {backup_file}")
-            except:
-                pass
-            self.z_params = {}
-            return self.z_params
+                return self.z_params
+                
         except Exception as e:
-            logger.error(f"加载z参数失败: {e}")
+            logger.error(f"从数据库加载z参数失败: {e}", exc_info=True)
+            # 降级到JSON文件
+            try:
+                if Z_PARAMS_FILE.exists():
+                    with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
+                        self.z_params = json.load(f)
+                    logger.info("z参数从JSON文件加载成功（降级）")
+                    return self.z_params
+            except Exception as json_e:
+                logger.error(f"从JSON文件加载也失败: {json_e}")
+            
             self.z_params = {}
             return self.z_params
     
     def save_params(self, z_param: str, s1ig_param: str = "11397", g_param: str = "") -> bool:
         """
-        保存z参数到文件（使用文件锁）
+        保存z参数到数据库（降级到JSON文件）
         
         Args:
             z_param: z参数值
@@ -81,29 +130,73 @@ class ZParamManager:
             是否保存成功
         """
         try:
+            updated_at = datetime.now().isoformat()
+            expires_in = 86400  # 24小时
+            expire_at = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
+            
             self.z_params = {
                 "z_param": z_param,
                 "s1ig_param": s1ig_param,
                 "g_param": g_param,
-                "updated_at": datetime.now().isoformat(),
-                "expires_in": 86400,  # 24小时
+                "updated_at": updated_at,
+                "expires_in": expires_in,
+                "expire_at": expire_at,
                 "source": "playwright"
             }
             
+            # 保存到数据库
             try:
-                with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
-                    f.seek(0)
-                    f.truncate(0)
-                    json.dump(self.z_params, f, indent=2, ensure_ascii=False)
-            except TimeoutError:
-                logger.warning("z参数文件锁超时，尝试直接写入")
-                with open(Z_PARAMS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(self.z_params, f, indent=2, ensure_ascii=False)
-            
-            logger.info("z参数保存成功")
-            return True
+                db = get_database()
+                
+                # 保存各个参数
+                params_to_save = [
+                    ('z_param', z_param, expire_at),
+                    ('s1ig_param', s1ig_param, None),
+                    ('g_param', g_param, None)
+                ]
+                
+                for param_key, param_value, param_expire_at in params_to_save:
+                    db.execute_update(
+                        """
+                        INSERT OR REPLACE INTO z_params_cache 
+                        (param_key, param_value, updated_at, expire_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (param_key, str(param_value), updated_at, param_expire_at)
+                    )
+                
+                logger.info("z参数保存到数据库成功")
+                
+                # 同时保存到JSON文件（兼容性）
+                try:
+                    with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
+                        f.seek(0)
+                        f.truncate(0)
+                        json.dump(self.z_params, f, indent=2, ensure_ascii=False)
+                except Exception as json_e:
+                    logger.debug(f"保存JSON文件失败（非关键）: {json_e}")
+                
+                return True
+                
+            except Exception as db_e:
+                logger.warning(f"保存到数据库失败，降级到JSON文件: {db_e}")
+                # 降级到JSON文件
+                try:
+                    with FileLock.lock_file(Z_PARAMS_FILE, timeout=5.0) as f:
+                        f.seek(0)
+                        f.truncate(0)
+                        json.dump(self.z_params, f, indent=2, ensure_ascii=False)
+                    logger.info("z参数保存到JSON文件成功（降级）")
+                    return True
+                except TimeoutError:
+                    logger.warning("z参数文件锁超时，尝试直接写入")
+                    with open(Z_PARAMS_FILE, 'w', encoding='utf-8') as f:
+                        json.dump(self.z_params, f, indent=2, ensure_ascii=False)
+                    logger.info("z参数保存成功（直接写入）")
+                    return True
+                    
         except Exception as e:
-            logger.error(f"保存z参数失败: {e}")
+            logger.error(f"保存z参数失败: {e}", exc_info=True)
             return False
     
     def get_z_param(self) -> Optional[str]:
