@@ -170,6 +170,9 @@ class ZParamParser:
         Returns:
             m3u8链接，如果失败返回None
         """
+        import time
+        start_time = time.time()
+        
         try:
             # 处理多集URL：如果包含$且后面跟着http://或https://，只取第一个URL
             if '$' in video_url and ('$http://' in video_url or '$https://' in video_url):
@@ -192,24 +195,36 @@ class ZParamParser:
             logger.info(f"使用z参数方案解析: {video_url}")
             
             # 检查z参数是否过期或不存在
+            z_param_check_start = time.time()
             if z_param_manager.is_expired() or not z_param_manager.get_z_param():
                 logger.info("z参数已过期或不存在，尝试更新...")
                 # 先尝试HTTP方式（快速）
+                http_update_start = time.time()
                 new_z = z_param_manager.update_with_http(video_url)
+                http_update_time = time.time() - http_update_start
+                logger.info(f"z参数解析器: HTTP方式更新耗时: {http_update_time:.2f}秒")
+                
                 # 如果HTTP方式失败，尝试Playwright方式（需要浏览器）
                 if not new_z:
                     logger.info("HTTP方式失败，尝试Playwright方式...")
+                    playwright_start = time.time()
                     # 始终在线程池中运行Playwright，避免asyncio冲突
                     # 因为即使parse()在单独线程中，Playwright仍可能检测到asyncio事件循环
                     try:
                         future = _playwright_executor.submit(z_param_manager.update_with_playwright, video_url)
                         new_z = future.result(timeout=60)  # 最多等待60秒
+                        playwright_time = time.time() - playwright_start
+                        logger.info(f"z参数解析器: Playwright方式更新耗时: {playwright_time:.2f}秒")
                     except Exception as e:
                         logger.error(f"Playwright线程执行失败: {e}", exc_info=True)
                         new_z = None
                 
                 if not new_z:
                     logger.warning("z参数更新失败，将尝试使用当前参数（如果存在）")
+            
+            z_param_check_time = time.time() - z_param_check_start
+            if z_param_check_time > 0.1:
+                logger.info(f"z参数解析器: z参数检查耗时: {z_param_check_time:.2f}秒")
             
             # 构造API URL
             api_url = self.construct_api_url(video_url)
@@ -218,7 +233,10 @@ class ZParamParser:
                 return None
             
             # 调用API
+            api_call_start = time.time()
             api_response, is_expired = self.call_api(api_url)
+            api_call_time = time.time() - api_call_start
+            logger.info(f"z参数解析器: API调用耗时: {api_call_time:.2f}秒")
             if not api_response:
                 # 如果检测到z参数过期，尝试更新并重试一次
                 if is_expired:
@@ -241,7 +259,10 @@ class ZParamParser:
                         api_url = self.construct_api_url(video_url)
                         if api_url:
                             # 重新调用API
+                            retry_api_start = time.time()
                             api_response, is_expired_retry = self.call_api(api_url)
+                            retry_api_time = time.time() - retry_api_start
+                            logger.info(f"z参数解析器: 重试API调用耗时: {retry_api_time:.2f}秒")
                             if not api_response:
                                 if is_expired_retry:
                                     logger.warning("z参数更新后API仍然返回过期错误")
@@ -259,13 +280,20 @@ class ZParamParser:
                     return None
             
             # 提取m3u8链接
+            extract_start = time.time()
             m3u8_url = self.extract_m3u8(api_response)
+            extract_time = time.time() - extract_start
+            if extract_time > 0.1:
+                logger.info(f"z参数解析器: 提取m3u8链接耗时: {extract_time:.2f}秒")
             
             if m3u8_url:
                 logger.info(f"z参数方案解析成功: {m3u8_url[:100]}...")
                 
                 # 下载并清理m3u8文件
+                download_start = time.time()
                 cleaned_m3u8_url = self._download_and_clean_m3u8(m3u8_url)
+                download_time = time.time() - download_start
+                logger.info(f"z参数解析器: 下载并清理m3u8文件耗时: {download_time:.2f}秒")
                 if cleaned_m3u8_url:
                     return cleaned_m3u8_url
                 else:
@@ -273,11 +301,19 @@ class ZParamParser:
                     return m3u8_url
             else:
                 logger.warning("未能从API响应中提取m3u8链接")
+                total_time = time.time() - start_time
+                logger.info(f"z参数解析器: 总耗时: {total_time:.2f}秒")
                 return None
                 
         except Exception as e:
             logger.error(f"z参数方案解析异常: {e}")
+            total_time = time.time() - start_time
+            logger.info(f"z参数解析器: 总耗时: {total_time:.2f}秒")
             return None
+        finally:
+            total_time = time.time() - start_time
+            if total_time > 1.0:  # 只记录超过1秒的耗时
+                logger.info(f"z参数解析器: 总耗时: {total_time:.2f}秒")
     
     def _generate_file_id(self, m3u8_url: str) -> str:
         """
@@ -294,6 +330,65 @@ class ZParamParser:
             # 如果没有hash，使用MD5
             hash_obj = hashlib.md5(m3u8_url.encode('utf-8'))
             return hash_obj.hexdigest()[:16]
+    
+    def _convert_relative_paths_to_absolute(self, m3u8_content: str, base_url: str) -> str:
+        """
+        将m3u8内容中的相对路径转换为绝对URL
+        
+        Args:
+            m3u8_content: m3u8文件内容
+            base_url: 用于转换相对路径的基础URL
+        
+        Returns:
+            转换后的m3u8内容
+        """
+        from urllib.parse import urljoin
+        
+        lines = m3u8_content.split('\n')
+        converted_lines = []
+        converted_count = 0
+        
+        for line in lines:
+            original_line = line
+            line_stripped = line.strip()
+            
+            # 处理#EXT-X-KEY标签中的URI属性
+            # 格式: #EXT-X-KEY:METHOD=AES-128,URI="/path/to/key.key",IV=...
+            if line_stripped.startswith('#EXT-X-KEY'):
+                # 匹配URI="..."或URI='...'中的相对路径
+                uri_pattern = r'URI=["\']([^"\']+)["\']'
+                uri_match = re.search(uri_pattern, line)
+                if uri_match:
+                    uri_value = uri_match.group(1)
+                    # 如果是相对路径（不是http://或https://开头，且不是//开头）
+                    if (not uri_value.startswith(('http://', 'https://')) and 
+                        not uri_value.startswith('//')):
+                        absolute_uri = urljoin(base_url, uri_value)
+                        # 保持原有的引号类型
+                        quote_char = '"' if '"' in uri_match.group(0) else "'"
+                        line = re.sub(uri_pattern, f'URI={quote_char}{absolute_uri}{quote_char}', line)
+                        converted_count += 1
+                        logger.debug(f"转换#EXT-X-KEY URI: {uri_value} -> {absolute_uri}")
+            
+            # 处理#EXTINF后面的ts文件路径（相对路径）
+            # 这些路径通常单独成行，不以#开头，且以/开头但不是//开头
+            elif line_stripped and not line_stripped.startswith('#'):
+                # 检查是否是相对路径（以/开头但不是//开头，且不是http://或https://）
+                if (line_stripped.startswith('/') and 
+                    not line_stripped.startswith('//') and 
+                    not line_stripped.startswith(('http://', 'https://'))):
+                    absolute_url = urljoin(base_url, line_stripped)
+                    # 保持原有的行格式（保留原始行的尾随空格等）
+                    line = line.replace(line_stripped, absolute_url)
+                    converted_count += 1
+                    logger.debug(f"转换ts文件路径: {line_stripped} -> {absolute_url}")
+            
+            converted_lines.append(line)
+        
+        if converted_count > 0:
+            logger.info(f"z参数解析器: 已将 {converted_count} 个相对路径转换为绝对URL")
+        
+        return '\n'.join(converted_lines) if converted_lines else m3u8_content
     
     def _download_and_clean_m3u8(self, m3u8_url: str) -> Optional[str]:
         """
@@ -337,12 +432,20 @@ class ZParamParser:
                 return f"{self.api_base_url}/api/v1/m3u8/{file_id}"
         
         try:
+            import time
+            download_start = time.time()
             # 下载m3u8文件
             response = self.session.get(m3u8_url, timeout=30)
             response.raise_for_status()
             m3u8_content = response.text
+            download_time = time.time() - download_start
+            logger.debug(f"z参数解析器: 下载初始m3u8文件耗时: {download_time:.2f}秒")
+            
+            # 保存最终的m3u8 URL（用于相对路径转换）
+            final_m3u8_url_for_base = m3u8_url
             
             # 检查是否是master playlist（包含#EXT-X-STREAM-INF）
+            master_playlist_start = time.time()
             if '#EXT-X-STREAM-INF' in m3u8_content:
                 logger.info(f"z参数解析器: 检测到master playlist，提取最终m3u8地址...")
                 
@@ -370,6 +473,9 @@ class ZParamParser:
                     else:
                         final_m3u8_url = final_m3u8_path
                     
+                    # 更新用于相对路径转换的base URL
+                    final_m3u8_url_for_base = final_m3u8_url
+                    
                     # 递归下载最终的m3u8文件（使用最终的URL）
                     # 注意：这里需要更新file_id和hash_match，因为最终的URL可能不同
                     final_hash_match = re.search(r'/Cache/[^/]+/([a-f0-9]+)\.m3u8', final_m3u8_url)
@@ -385,14 +491,32 @@ class ZParamParser:
                     
                     # 下载最终的m3u8文件
                     logger.info(f"z参数解析器: 下载最终的m3u8文件: {final_m3u8_url[:100]}...")
+                    final_download_start = time.time()
                     final_response = self.session.get(final_m3u8_url, timeout=30)
                     final_response.raise_for_status()
                     m3u8_content = final_response.text
+                    final_download_time = time.time() - final_download_start
+                    logger.debug(f"z参数解析器: 下载最终m3u8文件耗时: {final_download_time:.2f}秒")
                 else:
                     logger.warning(f"z参数解析器: 无法从master playlist中提取m3u8路径")
             
+            master_playlist_time = time.time() - master_playlist_start
+            if master_playlist_time > 0.1:
+                logger.debug(f"z参数解析器: master playlist处理耗时: {master_playlist_time:.2f}秒")
+            
+            # 将m3u8内容中的相对路径转换为绝对URL
+            convert_start = time.time()
+            m3u8_content = self._convert_relative_paths_to_absolute(m3u8_content, final_m3u8_url_for_base)
+            convert_time = time.time() - convert_start
+            if convert_time > 0.1:
+                logger.debug(f"z参数解析器: 相对路径转换耗时: {convert_time:.2f}秒")
+            
             # 清理m3u8内容
+            clean_start = time.time()
             cleaned_content = M3U8Cleaner.clean_m3u8_content(m3u8_content)
+            clean_time = time.time() - clean_start
+            if clean_time > 0.1:
+                logger.debug(f"z参数解析器: m3u8内容清理耗时: {clean_time:.2f}秒")
             
             # 生成文件名
             from datetime import datetime

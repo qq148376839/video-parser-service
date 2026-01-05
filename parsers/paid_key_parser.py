@@ -11,10 +11,11 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import requests
+from requests.exceptions import Timeout, RequestException
 import re
 import json
 import os
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -53,6 +54,14 @@ class PaidKeyM3U8Getter:
             self.json_file = json_file
         
         self.session = requests.Session()
+        # 优化连接池设置，提高性能
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=10,
+            pool_maxsize=20,
+            max_retries=0  # 禁用自动重试，由业务逻辑控制
+        )
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -63,10 +72,14 @@ class PaidKeyM3U8Getter:
     
     def load_keys(self) -> Dict:
         """加载key信息（从数据库读取）"""
+        import time
+        load_start = time.time()
+        
         try:
             db = get_database()
             
             # 从数据库加载keys
+            query_start = time.time()
             keys_records = db.execute_query(
                 """
                 SELECT email, password, uid, "key", register_time, expire_date
@@ -75,8 +88,12 @@ class PaidKeyM3U8Getter:
                 ORDER BY id
                 """
             )
+            query_time = time.time() - query_start
+            if query_time > 0.5:
+                logger.info(f"2s0解析器: 查询keys耗时: {query_time:.2f}秒 (共{len(keys_records)}条记录)")
             
             # 转换为列表格式
+            convert_start = time.time()
             keys = []
             for record in keys_records:
                 keys.append({
@@ -87,11 +104,19 @@ class PaidKeyM3U8Getter:
                     'register_time': record['register_time'],
                     'expire_date': record['expire_date']
                 })
+            convert_time = time.time() - convert_start
+            if convert_time > 0.5:
+                logger.info(f"2s0解析器: 转换keys格式耗时: {convert_time:.2f}秒")
             
             # 获取current_index
+            config_start = time.time()
             config = db.execute_one(
                 "SELECT config_value FROM registration_config WHERE config_key = 'current_index'"
             )
+            config_time = time.time() - config_start
+            if config_time > 0.5:
+                logger.info(f"2s0解析器: 查询current_index耗时: {config_time:.2f}秒")
+            
             current_index = int(config['config_value']) if config else 0
             
             # 构建返回数据（兼容旧格式）
@@ -99,6 +124,10 @@ class PaidKeyM3U8Getter:
                 'current_index': current_index,
                 'keys': keys
             }
+            
+            total_time = time.time() - load_start
+            if total_time > 0.5:
+                logger.info(f"2s0解析器: load_keys()总耗时: {total_time:.2f}秒")
             
             return data
             
@@ -118,11 +147,15 @@ class PaidKeyM3U8Getter:
     
     def save_keys(self, data: Dict) -> None:
         """保存key信息（保存到数据库）"""
+        import time
+        save_start = time.time()
+        
         try:
             db = get_database()
             
             # 保存current_index
             current_index = data.get('current_index', 0)
+            config_start = time.time()
             db.execute_update(
                 """
                 INSERT OR REPLACE INTO registration_config (config_key, config_value, updated_at)
@@ -130,9 +163,13 @@ class PaidKeyM3U8Getter:
                 """,
                 ('current_index', str(current_index))
             )
+            config_time = time.time() - config_start
+            if config_time > 0.5:
+                logger.info(f"2s0解析器: 保存current_index耗时: {config_time:.2f}秒")
             
             # 保存keys（更新现有记录）
             keys = data.get('keys', [])
+            keys_save_start = time.time()
             for key_info in keys:
                 email = key_info.get('email')
                 if not email:
@@ -154,7 +191,12 @@ class PaidKeyM3U8Getter:
                     )
                 )
             
-            logger.debug(f"2s0解析器: 已保存 {len(keys)} 个key到数据库")
+            keys_save_time = time.time() - keys_save_start
+            total_time = time.time() - save_start
+            if keys_save_time > 0.5 or total_time > 0.5:
+                logger.info(f"2s0解析器: 保存keys耗时: {keys_save_time:.2f}秒 (共{len(keys)}个key, 总耗时: {total_time:.2f}秒)")
+            else:
+                logger.debug(f"2s0解析器: 已保存 {len(keys)} 个key到数据库 (耗时: {total_time:.2f}秒)")
             
         except Exception as e:
             logger.error(f"2s0解析器: 保存key信息到数据库失败: {e}", exc_info=True)
@@ -191,130 +233,121 @@ class PaidKeyM3U8Getter:
         return datetime.now() > expire_date
     
     def get_next_valid_key(self) -> Optional[Dict]:
-        """获取下一个有效的key"""
+        """
+        获取下一个有效的key（通过SQL直接查询）
+        
+        轮询逻辑：
+        - 基于current_index获取下一个有效的key
+        - 如果当前索引的key无效（过期或is_active=0），继续查找下一个
+        - 如果遍历完所有key都没找到有效的，重置索引并返回None
+        """
+        import time
+        get_key_start = time.time()
+        
         try:
-            data = self.load_keys()
-        except FileNotFoundError:
-            logger.warning(f"2s0解析器: JSON文件不存在: {self.json_file}")
-            return None
-        except Exception as e:
-            logger.error(f"2s0解析器: 加载JSON文件失败: {e}")
-            return None
-        
-        # 处理JSON格式：如果是列表，转换为带元数据的格式
-        if isinstance(data, list):
-            # 首次加载列表格式，转换为带元数据的格式
-            keys = data
-            current_index = getattr(self, '_current_index', 0)
-            # 转换为新格式
-            data = {
-                'current_index': current_index,
-                'keys': keys
-            }
-            # 保存新格式
-            try:
-                self.save_keys(data)
-            except Exception as e:
-                logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-        elif isinstance(data, dict) and 'keys' in data:
-            keys = data['keys']
-            current_index = data.get('current_index', 0)
-        else:
-            logger.error(f"2s0解析器: JSON格式不正确: 期望list或dict with 'keys'")
-            return None
-        
-        # 更新JSON结构（添加expire_date）
-        keys, updated = self.update_json_structure(keys)
-        if updated:
-            data['keys'] = keys
-            try:
-                self.save_keys(data)
-            except Exception as e:
-                logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-        
-        # 如果keys为空，返回None
-        if not keys:
-            return None
-        
-        # 确保current_index在有效范围内
-        if current_index >= len(keys):
-            current_index = 0
-        
-        # 查找下一个有效的key（循环轮询）
-        original_length = len(keys)
-        start_index = current_index  # 记录起始索引
-        attempts = 0
-        
-        while attempts < original_length:  # 最多遍历一轮
-            # 如果keys为空，返回None
-            if not keys:
+            db = get_database()
+            
+            # 1. 获取当前索引
+            config_start = time.time()
+            config = db.execute_one(
+                "SELECT config_value FROM registration_config WHERE config_key = 'current_index'"
+            )
+            current_index = int(config['config_value']) if config and config.get('config_value') else 0
+            config_time = time.time() - config_start
+            if config_time > 0.5:
+                logger.info(f"2s0解析器: 查询current_index耗时: {config_time:.2f}秒")
+            
+            # 2. 获取所有有效keys的总数（用于轮询）
+            count_start = time.time()
+            count_result = db.execute_one(
+                """
+                SELECT COUNT(*) as total
+                FROM registrations
+                WHERE is_active = 1 AND (expire_date IS NULL OR expire_date > datetime('now'))
+                """
+            )
+            total_valid_keys = count_result['total'] if count_result else 0
+            count_time = time.time() - count_start
+            if count_time > 0.5:
+                logger.info(f"2s0解析器: 查询有效keys总数耗时: {count_time:.2f}秒")
+            
+            if total_valid_keys == 0:
+                logger.warning("2s0解析器: 没有有效的key")
                 return None
             
-            # 确保current_index在有效范围内
-            if current_index >= len(keys):
+            # 3. 确保current_index在有效范围内
+            if current_index >= total_valid_keys:
                 current_index = 0
             
-            key_info = keys[current_index]
+            # 4. 查询下一个有效的key（基于current_index轮询）
+            # 思路：获取所有有效keys，按id排序，跳过current_index个，取1个
+            query_start = time.time()
+            key_record = db.execute_one(
+                """
+                SELECT email, password, uid, "key", register_time, expire_date
+                FROM registrations
+                WHERE is_active = 1 AND (expire_date IS NULL OR expire_date > datetime('now'))
+                ORDER BY id
+                LIMIT 1 OFFSET ?
+                """,
+                (current_index,)
+            )
+            query_time = time.time() - query_start
+            if query_time > 0.5:
+                logger.info(f"2s0解析器: 查询有效key耗时: {query_time:.2f}秒")
             
-            # 检查是否过期
-            if self.is_key_expired(key_info):
-                logger.debug(f"2s0解析器: Key已过期: uid={key_info.get('uid')}, email={key_info.get('email')}")
-                # 删除过期的key
-                keys.pop(current_index)
-                
-                # 更新数据
-                data['keys'] = keys
-                
-                # 如果删除后没有key了，重置索引并返回None
-                if not keys:
-                    data['current_index'] = 0
-                    try:
-                        self.save_keys(data)
-                    except Exception as e:
-                        logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-                    return None
-                
-                # 更新current_index（如果删除后索引超出范围，重置为0）
-                if current_index >= len(keys):
-                    current_index = 0
-                
-                data['current_index'] = current_index
-                try:
-                    self.save_keys(data)
-                except Exception as e:
-                    logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-                
-                # 继续尝试当前索引（因为删除后，当前索引指向下一个元素）
-                attempts += 1
-                # 如果删除后索引回到了起始位置，说明已经遍历完一轮
-                if current_index == start_index % len(keys) if keys else False:
-                    break
-                continue
+            if not key_record:
+                # 如果当前索引没有找到，说明已经到末尾，重置索引并重新查询
+                logger.debug("2s0解析器: 当前索引已到末尾，重置索引")
+                current_index = 0
+                key_record = db.execute_one(
+                    """
+                    SELECT email, password, uid, "key", register_time, expire_date
+                    FROM registrations
+                    WHERE is_active = 1 AND (expire_date IS NULL OR expire_date > datetime('now'))
+                    ORDER BY id
+                    LIMIT 1 OFFSET 0
+                    """
+                )
             
-            # 找到有效的key，更新current_index到下一个（循环）
-            next_index = (current_index + 1) % len(keys) if keys else 0
+            if not key_record:
+                logger.warning("2s0解析器: 未找到有效的key")
+                return None
             
-            # 保存更新后的current_index
-            data['current_index'] = next_index
-            data['keys'] = keys
-            try:
-                self.save_keys(data)
-            except Exception as e:
-                logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-            self._current_index = next_index
+            # 5. 转换为字典格式
+            key_info = {
+                'email': key_record['email'],
+                'password': key_record['password'],
+                'uid': key_record['uid'],
+                'key': key_record['key'],
+                'register_time': key_record['register_time'],
+                'expire_date': key_record['expire_date']
+            }
+            
+            # 6. 更新current_index到下一个位置（循环）
+            next_index = (current_index + 1) % total_valid_keys if total_valid_keys > 0 else 0
+            
+            update_start = time.time()
+            db.execute_update(
+                """
+                INSERT OR REPLACE INTO registration_config (config_key, config_value, updated_at)
+                VALUES (?, ?, datetime('now'))
+                """,
+                ('current_index', str(next_index))
+            )
+            update_time = time.time() - update_start
+            if update_time > 0.5:
+                logger.info(f"2s0解析器: 更新current_index耗时: {update_time:.2f}秒")
+            
+            total_time = time.time() - get_key_start
+            if total_time > 0.5:
+                logger.info(f"2s0解析器: get_next_valid_key()总耗时: {total_time:.2f}秒")
             
             return key_info
-        
-        # 遍历完一轮后，重置索引到第一个，确保下次从第一个开始
-        if keys:
-            data['current_index'] = 0
-            try:
-                self.save_keys(data)
-            except Exception as e:
-                logger.error(f"2s0解析器: 保存JSON文件失败: {e}")
-            logger.warning("2s0解析器: 遍历完所有key，未找到有效key，已重置索引到第一个")
-        
-        return None
+            
+        except Exception as e:
+            logger.error(f"2s0解析器: 获取有效key失败: {e}", exc_info=True)
+            return None
     
     def get_m3u8_url(self, video_url: str, retry: bool = True) -> Optional[str]:
         """
@@ -327,8 +360,16 @@ class PaidKeyM3U8Getter:
         返回:
             m3u8 URL或None
         """
+        import time
+        get_url_start = time.time()
+        
         # 获取下一个有效的key
+        get_key_start = time.time()
         key_info = self.get_next_valid_key()
+        get_key_time = time.time() - get_key_start
+        if get_key_time > 0.1:  # 降低阈值，记录所有获取key的耗时
+            logger.info(f"2s0解析器: 获取下一个有效key耗时: {get_key_time:.3f}秒")
+        
         if not key_info:
             logger.warning("2s0解析器: 没有可用的key")
             return None
@@ -341,35 +382,63 @@ class PaidKeyM3U8Getter:
         url = f"https://json.2s0.cn:5678/player/analysis.php/?uid={uid}&key={key}&url={quote(video_url)}"
         
         try:
-            response = self.session.get(url, timeout=30)
+            # 记录请求开始时间
+            api_request_start = time.time()
+            logger.debug(f"2s0解析器: 开始API请求: {url[:100]}... (uid={uid})")
+            
+            # 优化超时设置：连接超时5秒，读取超时10秒（总共最多15秒）
+            # 如果API正常只需要900ms，15秒应该足够，避免等待太久
+            try:
+                response = self.session.get(url, timeout=(5, 10))
+            except Timeout as e:
+                api_request_time = time.time() - api_request_start
+                logger.error(f"2s0解析器: API请求超时: {api_request_time:.2f}秒 (uid={uid}, 超时设置: 连接5秒/读取10秒)")
+                raise
+            except RequestException as e:
+                api_request_time = time.time() - api_request_start
+                logger.error(f"2s0解析器: API请求异常: {e} (耗时: {api_request_time:.2f}秒, uid={uid})")
+                raise
+            
+            api_request_time = time.time() - api_request_start
+            if api_request_time > 2.0:  # 如果超过2秒，记录警告
+                logger.warning(f"2s0解析器: API请求耗时较长: {api_request_time:.2f}秒 (uid={uid}, 正常应该<1秒)")
+            else:
+                logger.info(f"2s0解析器: API请求耗时: {api_request_time:.2f}秒 (uid={uid})")
             if response.status_code == 200:
                 html = response.text
                 
                 # 提取m3u8 URL
+                extract_start = time.time()
                 m3u8_match = re.search(r'var url = "([^"]+)"', html)
+                extract_time = time.time() - extract_start
+                if extract_time > 0.1:
+                    logger.debug(f"2s0解析器: 提取m3u8 URL耗时: {extract_time:.2f}秒")
+                
                 if m3u8_match:
                     m3u8_url = m3u8_match.group(1)
-                    logger.debug(f"2s0解析器: 使用key成功: uid={uid}, email={key_info.get('email', 'N/A')}")
+                    total_time = time.time() - get_url_start
+                    logger.info(f"2s0解析器: 使用key成功: uid={uid}, email={key_info.get('email', 'N/A')} (总耗时: {total_time:.2f}秒)")
                     return m3u8_url
                 else:
-                    logger.debug(f"2s0解析器: 未找到m3u8 URL (uid={uid})")
+                    logger.warning(f"2s0解析器: 未找到m3u8 URL (uid={uid})")
                     # 如果允许重试，尝试下一个key
                     if retry:
-                        logger.debug("2s0解析器: 尝试下一个key...")
+                        logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {time.time() - get_url_start:.2f}秒)")
                         return self.get_m3u8_url(video_url, retry=False)
                     return None
             else:
-                logger.debug(f"2s0解析器: 请求失败: {response.status_code} (uid={uid})")
+                logger.warning(f"2s0解析器: 请求失败: {response.status_code} (uid={uid})")
                 # 如果允许重试，尝试下一个key
                 if retry:
-                    logger.debug("2s0解析器: 尝试下一个key...")
+                    logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {time.time() - get_url_start:.2f}秒)")
                     return self.get_m3u8_url(video_url, retry=False)
                 return None
         except Exception as e:
-            logger.debug(f"2s0解析器: 错误: {e} (uid={uid})")
+            total_time = time.time() - get_url_start
+            logger.warning(f"2s0解析器: 错误: {e} (uid={uid}, 耗时: {total_time:.2f}秒)")
             # 如果允许重试，尝试下一个key
             if retry:
-                logger.debug("2s0解析器: 尝试下一个key...")
+                logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {total_time:.2f}秒)")
                 return self.get_m3u8_url(video_url, retry=False)
             return None
     
@@ -417,10 +486,14 @@ class PaidKeyM3U8Getter:
         logger.debug(f"2s0解析器: 开始下载m3u8文件: {m3u8_url[:100]}...")
         
         try:
+            import time
+            download_start = time.time()
             # 下载m3u8文件内容
             response = self.session.get(m3u8_url, timeout=30)
             response.raise_for_status()
             m3u8_content = response.text
+            download_time = time.time() - download_start
+            logger.debug(f"2s0解析器: 下载m3u8内容耗时: {download_time:.2f}秒")
             
             # 生成输出文件名
             if not output_path:
@@ -442,12 +515,27 @@ class PaidKeyM3U8Getter:
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
             
+            # 将m3u8内容中的相对路径转换为绝对URL
+            convert_start = time.time()
+            m3u8_content = self._convert_relative_paths_to_absolute(m3u8_content, m3u8_url)
+            convert_time = time.time() - convert_start
+            if convert_time > 0.1:
+                logger.debug(f"2s0解析器: 相对路径转换耗时: {convert_time:.2f}秒")
+            
             # 清理m3u8内容
+            clean_start = time.time()
             cleaned_content = M3U8Cleaner.clean_m3u8_content(m3u8_content)
+            clean_time = time.time() - clean_start
+            if clean_time > 0.1:
+                logger.debug(f"2s0解析器: 清理m3u8内容耗时: {clean_time:.2f}秒")
             
             # 保存m3u8文件
+            save_start = time.time()
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(cleaned_content)
+            save_time = time.time() - save_start
+            if save_time > 0.1:
+                logger.debug(f"2s0解析器: 保存m3u8文件耗时: {save_time:.2f}秒")
             
             file_size = os.path.getsize(output_path)
             logger.info(f"2s0解析器: m3u8文件下载成功: {output_path} (大小: {file_size} 字节, 片段数: {cleaned_content.count('#EXTINF')})")
@@ -457,6 +545,63 @@ class PaidKeyM3U8Getter:
         except Exception as e:
             logger.error(f"2s0解析器: 下载m3u8文件失败: {e}")
             return None
+    
+    def _convert_relative_paths_to_absolute(self, m3u8_content: str, base_url: str) -> str:
+        """
+        将m3u8内容中的相对路径转换为绝对URL
+        
+        Args:
+            m3u8_content: m3u8文件内容
+            base_url: 用于转换相对路径的基础URL
+        
+        Returns:
+            转换后的m3u8内容
+        """
+        lines = m3u8_content.split('\n')
+        converted_lines = []
+        converted_count = 0
+        
+        for line in lines:
+            original_line = line
+            line_stripped = line.strip()
+            
+            # 处理#EXT-X-KEY标签中的URI属性
+            # 格式: #EXT-X-KEY:METHOD=AES-128,URI="enc.key",IV=...
+            if line_stripped.startswith('#EXT-X-KEY'):
+                # 匹配URI="..."或URI='...'中的相对路径
+                uri_pattern = r'URI=["\']([^"\']+)["\']'
+                uri_match = re.search(uri_pattern, line)
+                if uri_match:
+                    uri_value = uri_match.group(1)
+                    # 如果是相对路径（不是http://或https://开头，且不是//开头）
+                    if (not uri_value.startswith(('http://', 'https://')) and 
+                        not uri_value.startswith('//')):
+                        absolute_uri = urljoin(base_url, uri_value)
+                        # 保持原有的引号类型
+                        quote_char = '"' if '"' in uri_match.group(0) else "'"
+                        line = re.sub(uri_pattern, f'URI={quote_char}{absolute_uri}{quote_char}', line)
+                        converted_count += 1
+                        logger.debug(f"转换#EXT-X-KEY URI: {uri_value} -> {absolute_uri}")
+            
+            # 处理#EXTINF后面的ts文件路径（相对路径）
+            # 这些路径通常单独成行，不以#开头，且以/开头但不是//开头
+            elif line_stripped and not line_stripped.startswith('#'):
+                # 检查是否是相对路径（以/开头但不是//开头，且不是http://或https://）
+                if (line_stripped.startswith('/') and 
+                    not line_stripped.startswith('//') and 
+                    not line_stripped.startswith(('http://', 'https://'))):
+                    absolute_url = urljoin(base_url, line_stripped)
+                    # 保持原有的行格式（保留原始行的尾随空格等）
+                    line = line.replace(line_stripped, absolute_url)
+                    converted_count += 1
+                    logger.debug(f"转换ts文件路径: {line_stripped} -> {absolute_url}")
+            
+            converted_lines.append(line)
+        
+        if converted_count > 0:
+            logger.info(f"2s0解析器: 已将 {converted_count} 个相对路径转换为绝对URL")
+        
+        return '\n'.join(converted_lines) if converted_lines else m3u8_content
 
 
 class PaidKeyParser:
@@ -532,6 +677,9 @@ class PaidKeyParser:
         Returns:
             本地API接口的m3u8链接，如果失败返回None
         """
+        import time
+        start_time = time.time()
+        
         # 处理多集URL：如果包含$且后面跟着http://或https://，只取第一个URL
         if '$' in video_url and ('$http://' in video_url or '$https://' in video_url):
             # 找到第一个$http://或$https://的位置
@@ -552,6 +700,7 @@ class PaidKeyParser:
         
         # 重试机制：最多重试max_retries次
         for attempt in range(max_retries + 1):  # 0, 1, 2 共3次（首次+2次重试）
+            attempt_start = time.time()
             # 检查是否已取消
             if self._is_cancelled(video_url):
                 logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
@@ -564,7 +713,10 @@ class PaidKeyParser:
                     logger.info(f"2s0解析器: 使用2s0方案解析: {video_url[:100]}...")
                 
                 # 调用getter获取m3u8 URL（内部已有key轮询重试机制）
+                get_url_start = time.time()
                 m3u8_url = self.getter.get_m3u8_url(video_url, retry=True)
+                get_url_time = time.time() - get_url_start
+                logger.info(f"2s0解析器: 获取m3u8 URL耗时: {get_url_time:.2f}秒")
                 
                 # 再次检查是否已取消（在获取URL后）
                 if self._is_cancelled(video_url):
@@ -591,7 +743,10 @@ class PaidKeyParser:
                     return None
                 
                 # 下载m3u8文件
+                download_start = time.time()
                 m3u8_file_path = self.getter.download_m3u8_file(m3u8_url)
+                download_time = time.time() - download_start
+                logger.info(f"2s0解析器: 下载m3u8文件耗时: {download_time:.2f}秒")
                 
                 if not m3u8_file_path:
                     # 检查是否已取消
@@ -611,23 +766,27 @@ class PaidKeyParser:
                 
                 # 生成本地API接口URL
                 local_api_url = f"{self.api_base_url}/api/v1/m3u8/{file_id}"
+                attempt_time = time.time() - attempt_start
+                total_time = time.time() - start_time
                 if attempt > 0:
-                    logger.info(f"2s0解析器: 重试成功，返回本地API接口: {local_api_url}")
+                    logger.info(f"2s0解析器: 重试成功，返回本地API接口: {local_api_url} (本次尝试耗时: {attempt_time:.2f}秒, 总耗时: {total_time:.2f}秒)")
                 else:
-                    logger.info(f"2s0解析器: 解析成功，返回本地API接口: {local_api_url}")
+                    logger.info(f"2s0解析器: 解析成功，返回本地API接口: {local_api_url} (总耗时: {total_time:.2f}秒)")
                 
                 return local_api_url
                     
             except Exception as e:
+                attempt_time = time.time() - attempt_start
                 # 检查是否已取消
                 if self._is_cancelled(video_url):
                     logger.info(f"2s0解析器: 检测到取消信号，中断解析: {video_url[:100]}...")
                     return None
                 if attempt < max_retries:
-                    logger.warning(f"2s0解析器: 第{attempt+1}次尝试异常: {e}，准备重试...")
+                    logger.warning(f"2s0解析器: 第{attempt+1}次尝试异常: {e}，准备重试... (本次尝试耗时: {attempt_time:.2f}秒)")
                     continue
                 else:
-                    logger.error(f"2s0解析器: 解析异常（已重试{max_retries}次）: {e}")
+                    total_time = time.time() - start_time
+                    logger.error(f"2s0解析器: 解析异常（已重试{max_retries}次）: {e} (总耗时: {total_time:.2f}秒)")
                     return None
         
         # 所有重试都失败
