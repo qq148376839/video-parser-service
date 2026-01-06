@@ -39,6 +39,8 @@ data/logs/
 # 缓存文件
 data/m3u8_cache/*.m3u8
 
+# 数据库文件
+data/*.db
 
 # 备份文件
 data/backups/
@@ -63,3 +65,8 @@ z_param_debug.html
 # 操作系统
 .DS_Store
 Thumbs.db
+
+# 特殊文件
+data/z_params.json
+data/*.backups
+data/*.html

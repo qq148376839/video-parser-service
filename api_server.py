@@ -171,7 +171,8 @@ async def get_z_param(
         GET /api/get_z_param?video_url=https://v.youku.com/v_show/id_XMTA0MTc5NjU2.html
     """
     start_time = time.time()
-    video_url = video_url.strip()
+    # URL解码（处理可能的双重编码）
+    video_url = unquote(video_url).strip()
     
     # 验证URL格式
     if not video_url or not video_url.startswith(('http://', 'https://')):
@@ -510,7 +511,8 @@ async def parse_video(
         GET /api/v1/parse?url=https://www.iqiyi.com/v_xxx.html&parser_url=https://jx.789jiexi.com
     """
     start_time = time.time()
-    video_url = url.strip()
+    # URL解码（处理可能的双重编码）
+    video_url = unquote(url).strip()
     
     # 验证URL格式
     if not video_url or not video_url.startswith(('http://', 'https://')):
