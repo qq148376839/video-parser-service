@@ -1,1 +1,9 @@
-{}
+{
+  "z_param": "a037c5fdaf8efe76bea2b4964f7b3810",
+  "s1ig_param": "11399",
+  "g_param": "",
+  "updated_at": "2026-01-06T09:46:44.062226",
+  "expires_in": 86400,
+  "expire_at": "2026-01-07T09:46:44.062226",
+  "source": "playwright"
+}

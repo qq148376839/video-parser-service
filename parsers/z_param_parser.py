@@ -65,7 +65,7 @@ class ZParamParser:
             return None
         
         api_url = f"https://m1-a1.cloud.nnpp.vip:2223/api/v/?z={z_param}&jx={video_url}&s1ig={s1ig_param}&g={g_param}"
-        logger.debug(f"构造API URL: {api_url[:100]}...")
+        logger.info(f"z参数解析器: 构造API URL: {api_url[:100]}...")
         return api_url
     
     def call_api(self, api_url: str) -> Tuple[Optional[Dict], bool]:

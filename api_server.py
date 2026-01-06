@@ -5,6 +5,7 @@ FastAPI主服务
 import time
 import os
 import threading
+import asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response
@@ -98,11 +99,30 @@ async def lifespan(app: FastAPI):
     search_parser = SearchParser(api_base_url=api_base_url)
     
     logger.info("所有解析器初始化完成")
+    
+    # 5. 启动定时任务
+    scheduler = None
+    try:
+        logger.info("启动定时任务调度器...")
+        from tasks.daily_registration import start_scheduler
+        scheduler = start_scheduler()
+        logger.info("定时任务调度器启动成功")
+    except Exception as e:
+        logger.error(f"定时任务调度器启动失败: {e}", exc_info=True)
+        logger.warning("服务将继续运行，但定时任务功能可能不可用")
+    
     logger.info("=" * 60)
     
     yield
     
     # 关闭时清理
+    try:
+        if scheduler:
+            scheduler.shutdown()
+            logger.info("定时任务调度器已关闭")
+    except Exception as e:
+        logger.error(f"关闭定时任务调度器失败: {e}", exc_info=True)
+    
     logger.info("服务关闭")
 
 
@@ -193,8 +213,8 @@ async def get_z_param(
             loop = asyncio.get_event_loop()
         executor = ThreadPoolExecutor(max_workers=3)
         
-        # 并发执行2s0解析和z参数解析，哪个快返回哪个
-        logger.info("同时启动2s0解析和z参数解析...")
+        # 先启动2s0解析，如果3秒后还在解析，再启动z参数解析
+        logger.info("先启动2s0解析...")
         
         # 创建取消事件
         cancellation_event = threading.Event()
@@ -247,61 +267,159 @@ async def get_z_param(
                 logger.error(f"z参数解析异常: {e}")
                 return None, "z_param"
         
-        # 创建两个任务
+        # 先启动2s0解析任务
         task_2s0 = asyncio.create_task(parse_with_2s0())
-        task_z_param = asyncio.create_task(parse_with_z_param())
+        task_z_param = None
         
         # 等待第一个成功的任务
         m3u8_url = None
         method = None
         fallback_used = False
         
-        # 使用asyncio.wait等待第一个完成的任务
-        done, pending = await asyncio.wait(
-            [task_2s0, task_z_param],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-        # 检查已完成的任务
-        for task in done:
-            result, method_name = await task
-            if result:
-                m3u8_url = result
-                method = method_name
-                if method == "z_param":
-                    fallback_used = True
-                logger.info(f"{method}解析器最先返回结果")
-                # 设置取消事件，中断其他解析器
-                cancellation_event.set()
-                # 取消其他未完成的任务
-                for p in pending:
-                    p.cancel()
-                    try:
-                        await p
-                    except asyncio.CancelledError:
-                        pass
-                break
-        
-        # 如果第一个完成的任务没有结果，等待其他任务完成
-        if not m3u8_url and pending:
-            # 等待剩余任务完成
-            done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
-            # 只检查新完成的任务（之前done中的任务已经检查过了）
-            for task in done_remaining:
-                try:
+        # 等待2s0解析完成，最多等待3秒
+        try:
+            done, pending = await asyncio.wait(
+                [task_2s0],
+                timeout=3.0,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 检查2s0是否已完成
+            if done:
+                for task in done:
+                    result, method_name = await task
+                    if result:
+                        m3u8_url = result
+                        method = method_name
+                        logger.info(f"{method}解析器返回结果")
+                        # 设置取消事件，中断其他解析器
+                        cancellation_event.set()
+                        # 清理取消事件
+                        with _parse_cancellation_lock:
+                            _parse_cancellation_events.pop(video_url, None)
+                        # 如果2s0成功，直接返回（后续代码会处理缓存和返回）
+                        break
+                    else:
+                        # 2s0完成但没有结果，启动z参数解析
+                        logger.info("2s0解析完成但没有结果，启动z参数解析...")
+                        task_z_param = asyncio.create_task(parse_with_z_param())
+                        # 等待z参数解析完成
+                        done_z, pending_z = await asyncio.wait(
+                            [task_z_param],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task_z in done_z:
+                            result_z, method_name_z = await task_z
+                            if result_z:
+                                m3u8_url = result_z
+                                method = method_name_z
+                                fallback_used = True
+                                logger.info(f"{method}解析器返回结果")
+                                cancellation_event.set()
+                                break
+                        break
+            else:
+                # 3秒后2s0还在解析，启动z参数解析
+                logger.info("3秒后2s0还在解析，启动z参数解析...")
+                task_z_param = asyncio.create_task(parse_with_z_param())
+                
+                # 等待任一任务完成
+                done, pending = await asyncio.wait(
+                    [task_2s0, task_z_param],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # 检查已完成的任务
+                for task in done:
                     result, method_name = await task
                     if result:
                         m3u8_url = result
                         method = method_name
                         if method == "z_param":
                             fallback_used = True
-                        logger.info(f"{method}解析器返回结果")
+                        logger.info(f"{method}解析器最先返回结果")
                         # 设置取消事件，中断其他解析器
                         cancellation_event.set()
+                        # 取消其他未完成的任务
+                        for p in pending:
+                            p.cancel()
+                            try:
+                                await p
+                            except asyncio.CancelledError:
+                                pass
                         break
-                except Exception as e:
-                    logger.debug(f"任务异常: {e}")
-                    continue
+                
+                # 如果第一个完成的任务没有结果，等待其他任务完成
+                if not m3u8_url and pending:
+                    # 等待剩余任务完成
+                    done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+                    # 只检查新完成的任务（之前done中的任务已经检查过了）
+                    for task in done_remaining:
+                        try:
+                            result, method_name = await task
+                            if result:
+                                m3u8_url = result
+                                method = method_name
+                                if method == "z_param":
+                                    fallback_used = True
+                                logger.info(f"{method}解析器返回结果")
+                                # 设置取消事件，中断其他解析器
+                                cancellation_event.set()
+                                break
+                        except Exception as e:
+                            logger.debug(f"任务异常: {e}")
+                            continue
+        except asyncio.TimeoutError:
+            # 3秒超时，启动z参数解析
+            logger.info("3秒后2s0还在解析，启动z参数解析...")
+            task_z_param = asyncio.create_task(parse_with_z_param())
+            
+            # 等待任一任务完成
+            done, pending = await asyncio.wait(
+                [task_2s0, task_z_param],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 检查已完成的任务
+            for task in done:
+                result, method_name = await task
+                if result:
+                    m3u8_url = result
+                    method = method_name
+                    if method == "z_param":
+                        fallback_used = True
+                    logger.info(f"{method}解析器最先返回结果")
+                    # 设置取消事件，中断其他解析器
+                    cancellation_event.set()
+                    # 取消其他未完成的任务
+                    for p in pending:
+                        p.cancel()
+                        try:
+                            await p
+                        except asyncio.CancelledError:
+                            pass
+                    break
+            
+            # 如果第一个完成的任务没有结果，等待其他任务完成
+            if not m3u8_url and pending:
+                # 等待剩余任务完成
+                done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+                # 只检查新完成的任务（之前done中的任务已经检查过了）
+                for task in done_remaining:
+                    try:
+                        result, method_name = await task
+                        if result:
+                            m3u8_url = result
+                            method = method_name
+                            if method == "z_param":
+                                fallback_used = True
+                            logger.info(f"{method}解析器返回结果")
+                            # 设置取消事件，中断其他解析器
+                            cancellation_event.set()
+                            break
+                    except Exception as e:
+                        logger.debug(f"任务异常: {e}")
+                        continue
         
         # 清理取消事件（如果还没有被清理）
         with _parse_cancellation_lock:
@@ -434,8 +552,8 @@ async def parse_video(
             loop = asyncio.get_event_loop()
         executor = ThreadPoolExecutor(max_workers=3)
         
-        # 并发执行2s0解析和z参数解析，哪个快返回哪个
-        logger.info("同时启动2s0解析和z参数解析...")
+        # 先启动2s0解析，如果3秒后还在解析，再启动z参数解析
+        logger.info("先启动2s0解析...")
         
         # 创建取消事件
         cancellation_event = threading.Event()
@@ -488,61 +606,159 @@ async def parse_video(
                 logger.error(f"z参数解析异常: {e}")
                 return None, "z_param"
         
-        # 创建两个任务
+        # 先启动2s0解析任务
         task_2s0 = asyncio.create_task(parse_with_2s0())
-        task_z_param = asyncio.create_task(parse_with_z_param())
+        task_z_param = None
         
         # 等待第一个成功的任务
         m3u8_url = None
         method = None
         fallback_used = False
         
-        # 使用asyncio.wait等待第一个完成的任务
-        done, pending = await asyncio.wait(
-            [task_2s0, task_z_param],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-        
-        # 检查已完成的任务
-        for task in done:
-            result, method_name = await task
-            if result:
-                m3u8_url = result
-                method = method_name
-                if method == "z_param":
-                    fallback_used = True
-                logger.info(f"{method}解析器最先返回结果")
-                # 设置取消事件，中断其他解析器
-                cancellation_event.set()
-                # 取消其他未完成的任务
-                for p in pending:
-                    p.cancel()
-                    try:
-                        await p
-                    except asyncio.CancelledError:
-                        pass
-                break
-        
-        # 如果第一个完成的任务没有结果，等待其他任务完成
-        if not m3u8_url and pending:
-            # 等待剩余任务完成
-            done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
-            # 只检查新完成的任务（之前done中的任务已经检查过了）
-            for task in done_remaining:
-                try:
+        # 等待2s0解析完成，最多等待3秒
+        try:
+            done, pending = await asyncio.wait(
+                [task_2s0],
+                timeout=3.0,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 检查2s0是否已完成
+            if done:
+                for task in done:
+                    result, method_name = await task
+                    if result:
+                        m3u8_url = result
+                        method = method_name
+                        logger.info(f"{method}解析器返回结果")
+                        # 设置取消事件，中断其他解析器
+                        cancellation_event.set()
+                        # 清理取消事件
+                        with _parse_cancellation_lock:
+                            _parse_cancellation_events.pop(video_url, None)
+                        # 如果2s0成功，直接返回（后续代码会处理缓存和返回）
+                        break
+                    else:
+                        # 2s0完成但没有结果，启动z参数解析
+                        logger.info("2s0解析完成但没有结果，启动z参数解析...")
+                        task_z_param = asyncio.create_task(parse_with_z_param())
+                        # 等待z参数解析完成
+                        done_z, pending_z = await asyncio.wait(
+                            [task_z_param],
+                            return_when=asyncio.FIRST_COMPLETED
+                        )
+                        for task_z in done_z:
+                            result_z, method_name_z = await task_z
+                            if result_z:
+                                m3u8_url = result_z
+                                method = method_name_z
+                                fallback_used = True
+                                logger.info(f"{method}解析器返回结果")
+                                cancellation_event.set()
+                                break
+                        break
+            else:
+                # 3秒后2s0还在解析，启动z参数解析
+                logger.info("3秒后2s0还在解析，启动z参数解析...")
+                task_z_param = asyncio.create_task(parse_with_z_param())
+                
+                # 等待任一任务完成
+                done, pending = await asyncio.wait(
+                    [task_2s0, task_z_param],
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # 检查已完成的任务
+                for task in done:
                     result, method_name = await task
                     if result:
                         m3u8_url = result
                         method = method_name
                         if method == "z_param":
                             fallback_used = True
-                        logger.info(f"{method}解析器返回结果")
+                        logger.info(f"{method}解析器最先返回结果")
                         # 设置取消事件，中断其他解析器
                         cancellation_event.set()
+                        # 取消其他未完成的任务
+                        for p in pending:
+                            p.cancel()
+                            try:
+                                await p
+                            except asyncio.CancelledError:
+                                pass
                         break
-                except Exception as e:
-                    logger.debug(f"任务异常: {e}")
-                    continue
+                
+                # 如果第一个完成的任务没有结果，等待其他任务完成
+                if not m3u8_url and pending:
+                    # 等待剩余任务完成
+                    done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+                    # 只检查新完成的任务（之前done中的任务已经检查过了）
+                    for task in done_remaining:
+                        try:
+                            result, method_name = await task
+                            if result:
+                                m3u8_url = result
+                                method = method_name
+                                if method == "z_param":
+                                    fallback_used = True
+                                logger.info(f"{method}解析器返回结果")
+                                # 设置取消事件，中断其他解析器
+                                cancellation_event.set()
+                                break
+                        except Exception as e:
+                            logger.debug(f"任务异常: {e}")
+                            continue
+        except asyncio.TimeoutError:
+            # 3秒超时，启动z参数解析
+            logger.info("3秒后2s0还在解析，启动z参数解析...")
+            task_z_param = asyncio.create_task(parse_with_z_param())
+            
+            # 等待任一任务完成
+            done, pending = await asyncio.wait(
+                [task_2s0, task_z_param],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            # 检查已完成的任务
+            for task in done:
+                result, method_name = await task
+                if result:
+                    m3u8_url = result
+                    method = method_name
+                    if method == "z_param":
+                        fallback_used = True
+                    logger.info(f"{method}解析器最先返回结果")
+                    # 设置取消事件，中断其他解析器
+                    cancellation_event.set()
+                    # 取消其他未完成的任务
+                    for p in pending:
+                        p.cancel()
+                        try:
+                            await p
+                        except asyncio.CancelledError:
+                            pass
+                    break
+            
+            # 如果第一个完成的任务没有结果，等待其他任务完成
+            if not m3u8_url and pending:
+                # 等待剩余任务完成
+                done_remaining, _ = await asyncio.wait(pending, return_when=asyncio.ALL_COMPLETED)
+                # 只检查新完成的任务（之前done中的任务已经检查过了）
+                for task in done_remaining:
+                    try:
+                        result, method_name = await task
+                        if result:
+                            m3u8_url = result
+                            method = method_name
+                            if method == "z_param":
+                                fallback_used = True
+                            logger.info(f"{method}解析器返回结果")
+                            # 设置取消事件，中断其他解析器
+                            cancellation_event.set()
+                            break
+                    except Exception as e:
+                        logger.debug(f"任务异常: {e}")
+                        continue
         
         # 清理取消事件（如果还没有被清理）
         with _parse_cancellation_lock:
@@ -784,6 +1000,134 @@ async def get_m3u8_file(file_id: str, request: Request):
         }
 
 
+@app.post("/api/v1/register")
+async def trigger_registration(
+    count: int = Query(5, ge=1, le=20, description="注册数量（1-20）"),
+    password: str = Query("qwer1234!", description="注册密码"),
+    use_proxy: bool = Query(False, description="是否使用代理（Docker环境建议False）")
+):
+    """
+    手动触发账号注册任务（用于测试）
+    
+    Args:
+        count: 注册数量（1-20，默认5）
+        password: 注册密码（默认qwer1234!）
+        use_proxy: 是否使用代理（Docker环境建议False）
+    
+    Returns:
+        注册结果统计
+    """
+    logger.info(f"收到手动注册请求: count={count}, use_proxy={use_proxy}")
+    
+    try:
+        from register.batch_register_jx2s0 import batch_register
+        
+        # 在后台执行注册任务
+        task = asyncio.create_task(batch_register(count=count, password=password, use_proxy=use_proxy))
+        
+        # 等待任务完成（设置超时）
+        try:
+            await asyncio.wait_for(task, timeout=300)  # 5分钟超时
+        except asyncio.TimeoutError:
+            return {
+                "success": False,
+                "error": "注册任务超时（超过5分钟）"
+            }
+        
+        # 查询注册结果
+        db = get_database()
+        
+        # 获取最近注册的账号数量（最近1小时内）
+        recent_registrations = db.execute_query(
+            """
+            SELECT COUNT(*) as count 
+            FROM registrations 
+            WHERE created_at > datetime('now', '-1 hour')
+            """
+        )
+        
+        return {
+            "success": True,
+            "message": f"注册任务已完成，请求注册 {count} 个账号",
+            "recent_registrations": recent_registrations[0]['count'] if recent_registrations else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"手动注册任务失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"注册任务失败: {str(e)}"
+        }
+
+
+@app.get("/api/v1/registrations")
+async def get_registrations(
+    page: int = Query(1, ge=1, description="页码"),
+    page_size: int = Query(20, ge=1, le=100, description="每页数量"),
+    is_active: Optional[bool] = Query(None, description="是否激活（可选）")
+):
+    """
+    查询注册记录列表
+    
+    Args:
+        page: 页码（从1开始）
+        page_size: 每页数量（1-100）
+        is_active: 是否激活（可选，None表示全部）
+    
+    Returns:
+        注册记录列表和分页信息
+    """
+    try:
+        db = get_database()
+        
+        # 构建查询条件
+        where_clause = ""
+        params = []
+        
+        if is_active is not None:
+            where_clause = "WHERE is_active = ?"
+            params.append(1 if is_active else 0)
+        
+        # 查询总数
+        count_query = f"SELECT COUNT(*) as count FROM registrations {where_clause}"
+        total = db.execute_one(count_query, tuple(params))
+        total_count = total['count'] if total else 0
+        
+        # 查询分页数据
+        offset = (page - 1) * page_size
+        query = f"""
+            SELECT id, email, uid, register_time, expire_date, 
+                   created_at, updated_at, is_active
+            FROM registrations 
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([page_size, offset])
+        
+        registrations = db.execute_query(query, tuple(params))
+        
+        return {
+            "success": True,
+            "data": {
+                "items": registrations,
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total_count,
+                    "total_pages": (total_count + page_size - 1) // page_size
+                }
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"查询注册记录失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"查询失败: {str(e)}"
+        }
+
+
 @app.get("/health")
 async def health_check():
     """
@@ -814,7 +1158,7 @@ if __name__ == "__main__":
         "api_server:app",
         host="0.0.0.0",
         port=8000,
-        log_level="info",
+        log_level="debug",
         reload=False
     )
 
