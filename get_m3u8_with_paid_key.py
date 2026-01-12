@@ -6,6 +6,7 @@
 """
 
 import requests
+from requests.exceptions import SSLError
 import re
 import json
 import os
@@ -196,27 +197,48 @@ class PaidKeyM3U8Getter:
         key = key_info['key']
         self.current_uid = uid
         self.current_key = key
-        
-        url = f"https://json.2s0.cn:5678/player/analysis.php/?uid={uid}&key={key}&url={quote(video_url)}"
+
+        # 新版2s0接口：返回m3u8文件内容（或直接返回m3u8直链）
+        url = f"https://json.2s0.cn:5678/home/api?type=app&uid={uid}&key={key}&url={quote(video_url)}"
         
         try:
-            response = self.session.get(url, timeout=30)
+            # 禁用自动跳转，避免跳转到cachem3u8.2s0.cn时触发SSL证书验证失败
+            response = self.session.get(url, timeout=30, allow_redirects=False)
+
+            # 302/301等跳转：直接返回Location（通常是m3u8直链）
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location") or response.headers.get("location")
+                if location:
+                    print(f"✅ 使用key(home/api返回跳转): uid={uid}, email={key_info.get('email', 'N/A')}")
+                    return location
+                print(f"❌ home/api返回跳转但无Location (uid={uid})")
+                if retry:
+                    print("   尝试下一个key...")
+                    return self.get_m3u8_url(video_url, retry=False)
+                return None
+
             if response.status_code == 200:
-                html = response.text
-                
-                # 提取m3u8 URL
-                m3u8_match = re.search(r'var url = "([^"]+)"', html)
+                body = response.text or ""
+
+                # 1) 直接返回m3u8内容（此时把该API URL当成m3u8_url交给下载逻辑）
+                if "#EXTM3U" in body:
+                    print(f"✅ 使用key(返回m3u8内容): uid={uid}, email={key_info.get('email', 'N/A')}")
+                    return url
+
+                # 2) 兼容：响应里包含m3u8直链
+                m3u8_match = re.search(r'var url = "([^"]+)"', body)
+                if not m3u8_match:
+                    m3u8_match = re.search(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', body)
                 if m3u8_match:
                     m3u8_url = m3u8_match.group(1)
-                    print(f"✅ 使用key: uid={uid}, email={key_info.get('email', 'N/A')}")
+                    print(f"✅ 使用key(返回m3u8直链): uid={uid}, email={key_info.get('email', 'N/A')}")
                     return m3u8_url
-                else:
-                    print(f"❌ 未找到m3u8 URL (uid={uid})")
-                    # 如果允许重试，尝试下一个key
-                    if retry:
-                        print("   尝试下一个key...")
-                        return self.get_m3u8_url(video_url, retry=False)
-                    return None
+
+                print(f"❌ 未识别到m3u8内容或直链 (uid={uid})")
+                if retry:
+                    print("   尝试下一个key...")
+                    return self.get_m3u8_url(video_url, retry=False)
+                return None
             else:
                 print(f"❌ 请求失败: {response.status_code} (uid={uid})")
                 # 如果允许重试，尝试下一个key
@@ -224,6 +246,12 @@ class PaidKeyM3U8Getter:
                     print("   尝试下一个key...")
                     return self.get_m3u8_url(video_url, retry=False)
                 return None
+        except SSLError as e:
+            print(f"❌ SSL错误: {e} (uid={uid})")
+            if retry:
+                print("   尝试下一个key...")
+                return self.get_m3u8_url(video_url, retry=False)
+            return None
         except Exception as e:
             print(f"❌ 错误: {e} (uid={uid})")
             # 如果允许重试，尝试下一个key

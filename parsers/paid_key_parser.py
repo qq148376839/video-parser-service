@@ -11,7 +11,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import requests
-from requests.exceptions import Timeout, RequestException
+from requests.exceptions import Timeout, RequestException, SSLError
 import re
 import json
 import os
@@ -378,8 +378,11 @@ class PaidKeyM3U8Getter:
         key = key_info['key']
         self.current_uid = uid
         self.current_key = key
-        
-        url = f"https://json.2s0.cn:5678/player/analysis.php/?uid={uid}&key={key}&url={quote(video_url)}"
+
+        # 新版2s0接口：返回m3u8文件内容（或直接返回m3u8直链）
+        # 示例：
+        # https://json.2s0.cn:5678/home/api?type=app&uid=...&key=...&url=...
+        url = f"https://json.2s0.cn:5678/home/api?type=app&uid={uid}&key={key}&url={quote(video_url)}"
         
         try:
             # 记录请求开始时间
@@ -389,10 +392,16 @@ class PaidKeyM3U8Getter:
             # 优化超时设置：连接超时5秒，读取超时10秒（总共最多15秒）
             # 如果API正常只需要900ms，15秒应该足够，避免等待太久
             try:
-                response = self.session.get(url, timeout=(5, 10))
+                # 注意：home/api在部分key下会302跳转到cachem3u8.2s0.cn（证书可能过期）
+                # 这里禁用自动跳转，避免requests在跟随跳转时触发SSL验证失败而直接报错。
+                response = self.session.get(url, timeout=(5, 10), allow_redirects=False)
             except Timeout as e:
                 api_request_time = time.time() - api_request_start
                 logger.error(f"2s0解析器: API请求超时: {api_request_time:.2f}秒 (uid={uid}, 超时设置: 连接5秒/读取10秒)")
+                raise
+            except SSLError as e:
+                api_request_time = time.time() - api_request_start
+                logger.error(f"2s0解析器: API请求SSL错误: {e} (耗时: {api_request_time:.2f}秒, uid={uid})")
                 raise
             except RequestException as e:
                 api_request_time = time.time() - api_request_start
@@ -404,28 +413,48 @@ class PaidKeyM3U8Getter:
                 logger.warning(f"2s0解析器: API请求耗时较长: {api_request_time:.2f}秒 (uid={uid}, 正常应该<1秒)")
             else:
                 logger.info(f"2s0解析器: API请求耗时: {api_request_time:.2f}秒 (uid={uid})")
+            # 302/301等跳转：直接返回Location（通常是m3u8直链）
+            if response.status_code in (301, 302, 303, 307, 308):
+                location = response.headers.get("Location") or response.headers.get("location")
+                if location:
+                    logger.info(f"2s0解析器: home/api返回跳转({response.status_code})，使用Location作为m3u8直链")
+                    return location
+                logger.warning(f"2s0解析器: home/api返回跳转({response.status_code})但无Location (uid={uid})")
+                if retry:
+                    logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {time.time() - get_url_start:.2f}秒)")
+                    return self.get_m3u8_url(video_url, retry=False)
+                return None
+
             if response.status_code == 200:
-                html = response.text
-                
-                # 提取m3u8 URL
+                body = response.text or ""
+
+                # 1) 直接返回m3u8文件内容（推荐路径）
+                if "#EXTM3U" in body:
+                    total_time = time.time() - get_url_start
+                    logger.info(f"2s0解析器: 使用key成功(返回m3u8内容): uid={uid}, email={key_info.get('email', 'N/A')} (总耗时: {total_time:.2f}秒)")
+                    # 让后续download_m3u8_file直接下载该URL并写入缓存文件
+                    return url
+
+                # 2) 兼容旧响应：HTML/JSON里包含m3u8直链
                 extract_start = time.time()
-                m3u8_match = re.search(r'var url = "([^"]+)"', html)
+                m3u8_match = re.search(r'var url = "([^"]+)"', body)
+                if not m3u8_match:
+                    m3u8_match = re.search(r'(https?://[^\s"\']+\.m3u8[^\s"\']*)', body)
                 extract_time = time.time() - extract_start
                 if extract_time > 0.1:
-                    logger.debug(f"2s0解析器: 提取m3u8 URL耗时: {extract_time:.2f}秒")
-                
+                    logger.debug(f"2s0解析器: 提取m3u8信息耗时: {extract_time:.2f}秒")
+
                 if m3u8_match:
                     m3u8_url = m3u8_match.group(1)
                     total_time = time.time() - get_url_start
-                    logger.info(f"2s0解析器: 使用key成功: uid={uid}, email={key_info.get('email', 'N/A')} (总耗时: {total_time:.2f}秒)")
+                    logger.info(f"2s0解析器: 使用key成功(返回m3u8直链): uid={uid}, email={key_info.get('email', 'N/A')} (总耗时: {total_time:.2f}秒)")
                     return m3u8_url
-                else:
-                    logger.warning(f"2s0解析器: 未找到m3u8 URL (uid={uid})")
-                    # 如果允许重试，尝试下一个key
-                    if retry:
-                        logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {time.time() - get_url_start:.2f}秒)")
-                        return self.get_m3u8_url(video_url, retry=False)
-                    return None
+
+                logger.warning(f"2s0解析器: 未识别到m3u8内容或直链 (uid={uid})")
+                if retry:
+                    logger.info(f"2s0解析器: 尝试下一个key... (当前key耗时: {time.time() - get_url_start:.2f}秒)")
+                    return self.get_m3u8_url(video_url, retry=False)
+                return None
             else:
                 logger.warning(f"2s0解析器: 请求失败: {response.status_code} (uid={uid})")
                 # 如果允许重试，尝试下一个key
@@ -489,8 +518,14 @@ class PaidKeyM3U8Getter:
             import time
             download_start = time.time()
             # 下载m3u8文件内容
-            response = self.session.get(m3u8_url, timeout=30)
-            response.raise_for_status()
+            try:
+                response = self.session.get(m3u8_url, timeout=30)
+                response.raise_for_status()
+            except SSLError as e:
+                # 兼容：cachem3u8.2s0.cn 证书过期时，降级跳过证书校验重试一次
+                logger.warning(f"2s0解析器: 下载m3u8遇到SSL错误，降级verify=False重试: {e}")
+                response = self.session.get(m3u8_url, timeout=30, verify=False)
+                response.raise_for_status()
             m3u8_content = response.text
             download_time = time.time() - download_start
             logger.debug(f"2s0解析器: 下载m3u8内容耗时: {download_time:.2f}秒")
