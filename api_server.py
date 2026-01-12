@@ -23,6 +23,7 @@ from parsers.paid_key_parser import PaidKeyParser
 from parsers.z_param_parser import ZParamParser
 from parsers.decrypt_parser import DecryptParser
 from parsers.search_parser import SearchParser
+from clear_cache import clear_m3u8_cache_files, m3u8_cache_dir
 
 # 设置日志
 setup_logger("video_parser", log_file="api_server.log")
@@ -1127,6 +1128,40 @@ async def get_registrations(
         return {
             "success": False,
             "error": f"查询失败: {str(e)}"
+        }
+
+
+@app.post("/api/v1/cache/m3u8/clear")
+async def clear_m3u8_cache_endpoint(
+    verbose: bool = Query(False, description="是否返回更详细信息（默认false）")
+):
+    """
+    清理m3u8缓存文件（人为触发）
+    
+    Returns:
+        清理结果，包含删除文件数量
+    """
+    try:
+        removed = clear_m3u8_cache_files(verbose=False)
+        remaining = 0
+        if verbose:
+            try:
+                if m3u8_cache_dir.exists():
+                    remaining = len(list(m3u8_cache_dir.glob("*.m3u8")))
+            except Exception:
+                remaining = 0
+        return {
+            "success": True,
+            "message": "m3u8缓存清理完成",
+            "removed": removed,
+            "cache_dir": str(m3u8_cache_dir),
+            "remaining": remaining if verbose else None
+        }
+    except Exception as e:
+        logger.error(f"清理m3u8缓存失败: {e}", exc_info=True)
+        return {
+            "success": False,
+            "error": f"清理m3u8缓存失败: {str(e)}"
         }
 
 

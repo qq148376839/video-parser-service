@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from utils.logger import logger
 from register.batch_register_jx2s0 import batch_register
+from clear_cache import clear_m3u8_cache_files
 
 
 async def daily_registration_task():
@@ -21,6 +22,16 @@ async def daily_registration_task():
     logger.info("=" * 60)
     
     try:
+        # 0. 清理m3u8缓存文件（不影响主流程）
+        try:
+            removed = clear_m3u8_cache_files(verbose=False)
+            if removed > 0:
+                logger.info(f"每日注册前已清理m3u8缓存文件: {removed} 个")
+            else:
+                logger.info("每日注册前m3u8缓存无需清理")
+        except Exception as e:
+            logger.warning(f"每日注册前清理m3u8缓存失败（忽略继续注册）: {e}")
+
         # 从环境变量读取配置
         registration_count = int(os.getenv("DAILY_REGISTRATION_COUNT", "5"))
         registration_password = os.getenv("DAILY_REGISTRATION_PASSWORD", "qwer1234!")

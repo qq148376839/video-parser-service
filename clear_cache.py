@@ -16,22 +16,50 @@ db_path = data_dir / "video_parser.db"
 m3u8_cache_dir = data_dir / "m3u8_cache"
 
 
-def clear_m3u8_cache():
-    """清理m3u8文件缓存"""
-    if m3u8_cache_dir.exists():
-        files = list(m3u8_cache_dir.glob("*.m3u8"))
-        if files:
-            for file in files:
-                try:
-                    file.unlink()
-                    print(f"✓ 删除m3u8缓存文件: {file.name}")
-                except Exception as e:
-                    print(f"✗ 删除失败 {file.name}: {e}")
-            print(f"✓ 已清理 {len(files)} 个m3u8缓存文件")
-        else:
+def clear_m3u8_cache_files(verbose: bool = False) -> int:
+    """
+    清理m3u8缓存目录下的m3u8文件（可被服务端任务/接口直接调用）
+    
+    Args:
+        verbose: 是否打印详细信息（CLI脚本使用True；服务端通常用False）
+    
+    Returns:
+        删除的m3u8文件数量
+    """
+    removed = 0
+    
+    if not m3u8_cache_dir.exists():
+        if verbose:
+            print("✓ m3u8缓存目录不存在，无需清理")
+        return 0
+    
+    files = list(m3u8_cache_dir.glob("*.m3u8"))
+    if not files:
+        if verbose:
             print("✓ m3u8缓存目录为空，无需清理")
-    else:
-        print("✓ m3u8缓存目录不存在，无需清理")
+        return 0
+    
+    for file in files:
+        try:
+            file.unlink()
+            removed += 1
+            if verbose:
+                print(f"✓ 删除m3u8缓存文件: {file.name}")
+        except Exception as e:
+            if verbose:
+                print(f"✗ 删除失败 {file.name}: {e}")
+            # 服务端/定时任务场景：尽量继续清理其他文件
+            continue
+    
+    if verbose:
+        print(f"✓ 已清理 {removed} 个m3u8缓存文件")
+    
+    return removed
+
+
+def clear_m3u8_cache():
+    """清理m3u8文件缓存（保持CLI兼容）"""
+    clear_m3u8_cache_files(verbose=True)
 
 
 def clear_database_cache():
