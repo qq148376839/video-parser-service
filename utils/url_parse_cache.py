@@ -3,6 +3,7 @@ URL解析缓存管理模块
 负责URL解析结果的缓存读写、过期检查和缓存清理
 """
 import json
+import os
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any
 from urllib.parse import urlparse
@@ -206,6 +207,58 @@ class URLParseCache:
         except Exception as e:
             logger.error(f"获取缓存统计失败: {e}", exc_info=True)
             return {'total': 0, 'expired': 0, 'total_hits': 0}
+
+    def purge_missing_m3u8_files(self) -> int:
+        """
+        清理那些指向不存在 m3u8_file_path 的缓存记录（避免返回“坏缓存”）
+        
+        Returns:
+            清理的记录数
+        """
+        try:
+            rows = self.db.execute_query(
+                """
+                SELECT video_url, m3u8_file_path
+                FROM url_parse_cache
+                WHERE m3u8_file_path IS NOT NULL AND m3u8_file_path != ''
+                """
+            )
+            
+            removed = 0
+            for r in rows:
+                video_url = r.get("video_url")
+                file_path = r.get("m3u8_file_path")
+                if not file_path:
+                    continue
+                if not os.path.exists(file_path):
+                    if video_url:
+                        if self.delete_cache(video_url):
+                            removed += 1
+            
+            if removed > 0:
+                logger.info(f"已清理 {removed} 条无效URL解析缓存（m3u8文件不存在）")
+            return removed
+        except Exception as e:
+            logger.error(f"清理无效URL解析缓存失败: {e}", exc_info=True)
+            return 0
+
+    def clear_all(self) -> int:
+        """
+        清空所有URL解析缓存（强制全量清理）
+        
+        Returns:
+            清理的记录数
+        """
+        try:
+            rows = self.db.execute_update("DELETE FROM url_parse_cache")
+            if rows > 0:
+                logger.info(f"已清空URL解析缓存表: {rows} 条")
+            else:
+                logger.info("URL解析缓存表为空，无需清理")
+            return rows if rows and rows > 0 else 0
+        except Exception as e:
+            logger.error(f"清空URL解析缓存失败: {e}", exc_info=True)
+            return 0
 
 
 # 全局URL解析缓存实例

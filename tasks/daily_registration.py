@@ -24,7 +24,7 @@ async def daily_registration_task():
     try:
         # 0. 清理m3u8缓存文件（不影响主流程）
         try:
-            removed = clear_m3u8_cache_files(verbose=False)
+            removed = clear_m3u8_cache_files(verbose=False, purge_url_parse_cache=True)
             if removed > 0:
                 logger.info(f"每日注册前已清理m3u8缓存文件: {removed} 个")
             else:

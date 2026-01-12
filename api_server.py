@@ -190,17 +190,24 @@ async def get_z_param(
         # 1. 检查缓存
         cache_result = url_parse_cache.get_cache(video_url)
         if cache_result:
-            cache_time = time.time() - start_time
-            logger.info(f"从缓存返回结果 (耗时: {cache_time:.3f}秒)")
-            return {
-                "success": True,
-                "data": {
-                    "m3u8_url": cache_result['m3u8_url'],
-                    "method": cache_result.get('parse_method', 'unknown'),
-                    "parse_time": round(cache_time, 3),
-                    "cached": True
+            # 缓存命中但m3u8文件可能已被清理：做一次存在性校验，避免返回“坏缓存”
+            cached_file_path = cache_result.get("m3u8_file_path")
+            cached_m3u8_url = cache_result.get("m3u8_url", "")
+            if cached_file_path and "/api/v1/m3u8/" in cached_m3u8_url and not os.path.exists(cached_file_path):
+                logger.warning(f"缓存命中但m3u8文件不存在，自动失效并重新解析: {cached_file_path}")
+                url_parse_cache.delete_cache(video_url)
+            else:
+                cache_time = time.time() - start_time
+                logger.info(f"从缓存返回结果 (耗时: {cache_time:.3f}秒)")
+                return {
+                    "success": True,
+                    "data": {
+                        "m3u8_url": cache_result['m3u8_url'],
+                        "method": cache_result.get('parse_method', 'unknown'),
+                        "parse_time": round(cache_time, 3),
+                        "cached": True
+                    }
                 }
-            }
         
         # 2. 缓存未命中，执行解析
         import asyncio
@@ -530,17 +537,24 @@ async def parse_video(
         # 1. 检查缓存
         cache_result = url_parse_cache.get_cache(video_url)
         if cache_result:
-            cache_time = time.time() - start_time
-            logger.info(f"从缓存返回结果 (耗时: {cache_time:.3f}秒)")
-            return {
-                "success": True,
-                "data": {
-                    "m3u8_url": cache_result['m3u8_url'],
-                    "method": cache_result.get('parse_method', 'unknown'),
-                    "parse_time": round(cache_time, 3),
-                    "cached": True
+            # 缓存命中但m3u8文件可能已被清理：做一次存在性校验，避免返回“坏缓存”
+            cached_file_path = cache_result.get("m3u8_file_path")
+            cached_m3u8_url = cache_result.get("m3u8_url", "")
+            if cached_file_path and "/api/v1/m3u8/" in cached_m3u8_url and not os.path.exists(cached_file_path):
+                logger.warning(f"缓存命中但m3u8文件不存在，自动失效并重新解析: {cached_file_path}")
+                url_parse_cache.delete_cache(video_url)
+            else:
+                cache_time = time.time() - start_time
+                logger.info(f"从缓存返回结果 (耗时: {cache_time:.3f}秒)")
+                return {
+                    "success": True,
+                    "data": {
+                        "m3u8_url": cache_result['m3u8_url'],
+                        "method": cache_result.get('parse_method', 'unknown'),
+                        "parse_time": round(cache_time, 3),
+                        "cached": True
+                    }
                 }
-            }
         
         # 2. 缓存未命中，执行解析
         import asyncio
@@ -1133,6 +1147,7 @@ async def get_registrations(
 
 @app.post("/api/v1/cache/m3u8/clear")
 async def clear_m3u8_cache_endpoint(
+    mode: str = Query("all", description="清理模式：all=清空url_parse_cache表；invalid_only=仅清理无效记录（缺失m3u8文件引用）"),
     verbose: bool = Query(False, description="是否返回更详细信息（默认false）")
 ):
     """
@@ -1142,7 +1157,18 @@ async def clear_m3u8_cache_endpoint(
         清理结果，包含删除文件数量
     """
     try:
-        removed = clear_m3u8_cache_files(verbose=False)
+        # 1) 先清理m3u8文件缓存
+        removed = clear_m3u8_cache_files(verbose=False, purge_url_parse_cache=False)
+
+        # 2) 默认同时清理数据库缓存（避免坏缓存）
+        db_removed = 0
+        mode_normalized = (mode or "all").strip().lower()
+        if mode_normalized in ("invalid_only", "invalid", "missing_only"):
+            db_removed = url_parse_cache.purge_missing_m3u8_files()
+        else:
+            # 默认all：全量清空（用户无参数场景）
+            db_removed = url_parse_cache.clear_all()
+
         remaining = 0
         if verbose:
             try:
@@ -1154,6 +1180,8 @@ async def clear_m3u8_cache_endpoint(
             "success": True,
             "message": "m3u8缓存清理完成",
             "removed": removed,
+            "url_parse_cache_removed": db_removed,
+            "mode": mode_normalized,
             "cache_dir": str(m3u8_cache_dir),
             "remaining": remaining if verbose else None
         }

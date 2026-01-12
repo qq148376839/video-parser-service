@@ -16,7 +16,7 @@ db_path = data_dir / "video_parser.db"
 m3u8_cache_dir = data_dir / "m3u8_cache"
 
 
-def clear_m3u8_cache_files(verbose: bool = False) -> int:
+def clear_m3u8_cache_files(verbose: bool = False, purge_url_parse_cache: bool = False) -> int:
     """
     清理m3u8缓存目录下的m3u8文件（可被服务端任务/接口直接调用）
     
@@ -54,6 +54,17 @@ def clear_m3u8_cache_files(verbose: bool = False) -> int:
     if verbose:
         print(f"✓ 已清理 {removed} 个m3u8缓存文件")
     
+    # 可选：同步清理URL解析缓存中指向不存在文件的记录，避免返回“坏缓存”
+    if purge_url_parse_cache:
+        try:
+            from utils.url_parse_cache import url_parse_cache
+            purged = url_parse_cache.purge_missing_m3u8_files()
+            if verbose and purged > 0:
+                print(f"✓ 已清理 {purged} 条无效URL解析缓存记录")
+        except Exception as e:
+            if verbose:
+                print(f"⚠ 清理无效URL解析缓存失败（忽略）: {e}")
+
     return removed
 
 
