@@ -18,13 +18,15 @@ m3u8_cache_dir = data_dir / "m3u8_cache"
 
 def clear_m3u8_cache_files(verbose: bool = False, purge_url_parse_cache: bool = False) -> int:
     """
-    清理m3u8缓存目录下的m3u8文件（可被服务端任务/接口直接调用）
+    清理m3u8缓存目录下的缓存文件（可被服务端任务/接口直接调用）
+    - m3u8文件：*.m3u8
+    - key文件：*.key（#EXT-X-KEY缓存，避免原始key地址过期/崩溃导致无法播放）
     
     Args:
         verbose: 是否打印详细信息（CLI脚本使用True；服务端通常用False）
     
     Returns:
-        删除的m3u8文件数量
+        删除的缓存文件数量（m3u8 + key）
     """
     removed = 0
     
@@ -33,7 +35,9 @@ def clear_m3u8_cache_files(verbose: bool = False, purge_url_parse_cache: bool = 
             print("✓ m3u8缓存目录不存在，无需清理")
         return 0
     
-    files = list(m3u8_cache_dir.glob("*.m3u8"))
+    files = []
+    files.extend(list(m3u8_cache_dir.glob("*.m3u8")))
+    files.extend(list(m3u8_cache_dir.glob("*.key")))
     if not files:
         if verbose:
             print("✓ m3u8缓存目录为空，无需清理")
@@ -44,7 +48,7 @@ def clear_m3u8_cache_files(verbose: bool = False, purge_url_parse_cache: bool = 
             file.unlink()
             removed += 1
             if verbose:
-                print(f"✓ 删除m3u8缓存文件: {file.name}")
+                print(f"✓ 删除缓存文件: {file.name}")
         except Exception as e:
             if verbose:
                 print(f"✗ 删除失败 {file.name}: {e}")
@@ -52,7 +56,7 @@ def clear_m3u8_cache_files(verbose: bool = False, purge_url_parse_cache: bool = 
             continue
     
     if verbose:
-        print(f"✓ 已清理 {removed} 个m3u8缓存文件")
+        print(f"✓ 已清理 {removed} 个缓存文件")
     
     # 可选：同步清理URL解析缓存中指向不存在文件的记录，避免返回“坏缓存”
     if purge_url_parse_cache:

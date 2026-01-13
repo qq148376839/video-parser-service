@@ -1118,12 +1118,15 @@ async def clear_m3u8_cache_endpoint(
             db_removed = url_parse_cache.clear_all()
 
         remaining = 0
+        remaining_keys = 0
         if verbose:
             try:
                 if m3u8_cache_dir.exists():
                     remaining = len(list(m3u8_cache_dir.glob("*.m3u8")))
+                    remaining_keys = len(list(m3u8_cache_dir.glob("*.key")))
             except Exception:
                 remaining = 0
+                remaining_keys = 0
         return {
             "success": True,
             "message": "m3u8缓存清理完成",
@@ -1131,7 +1134,8 @@ async def clear_m3u8_cache_endpoint(
             "url_parse_cache_removed": db_removed,
             "mode": mode_normalized,
             "cache_dir": str(m3u8_cache_dir),
-            "remaining": remaining if verbose else None
+            "remaining": remaining if verbose else None,
+            "remaining_keys": remaining_keys if verbose else None
         }
     except Exception as e:
         logger.error(f"清理m3u8缓存失败: {e}", exc_info=True)

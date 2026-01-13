@@ -22,6 +22,7 @@ from pathlib import Path
 from utils.logger import logger
 from utils.file_lock import FileLock
 from utils.m3u8_cleaner import M3U8Cleaner
+from utils.m3u8_key_rewriter import rewrite_m3u8_key_uris
 from utils.database import get_database
 
 
@@ -556,6 +557,22 @@ class PaidKeyM3U8Getter:
             convert_time = time.time() - convert_start
             if convert_time > 0.1:
                 logger.debug(f"2s0解析器: 相对路径转换耗时: {convert_time:.2f}秒")
+
+            # 处理m3u8中的#EXT-X-KEY：下载key并把URI改写为本服务地址，避免原始key地址过期/崩溃
+            try:
+                key_start = time.time()
+                api_base_url = os.getenv("API_BASE_URL", "http://localhost:8000")
+                m3u8_content, rewritten = rewrite_m3u8_key_uris(
+                    m3u8_content=m3u8_content,
+                    m3u8_url_for_base=m3u8_url,
+                    api_base_url=api_base_url,
+                    session=self.session,
+                )
+                key_time = time.time() - key_start
+                if rewritten > 0:
+                    logger.info(f"2s0解析器: KEY处理完成（改写{rewritten}处，耗时: {key_time:.2f}秒）")
+            except Exception as e:
+                logger.warning(f"2s0解析器: KEY处理失败（忽略，继续返回原m3u8）: {e}")
             
             # 清理m3u8内容
             clean_start = time.time()

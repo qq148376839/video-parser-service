@@ -13,6 +13,7 @@ from typing import Optional, Dict, Tuple
 from utils.logger import logger
 from utils.z_param_manager import z_param_manager
 from utils.m3u8_cleaner import M3U8Cleaner
+from utils.m3u8_key_rewriter import rewrite_m3u8_key_uris
 
 # 项目根目录
 project_root = Path(__file__).parent.parent
@@ -517,6 +518,21 @@ class ZParamParser:
             clean_time = time.time() - clean_start
             if clean_time > 0.1:
                 logger.debug(f"z参数解析器: m3u8内容清理耗时: {clean_time:.2f}秒")
+
+            # 处理m3u8中的#EXT-X-KEY：下载key并把URI改写为本服务地址
+            try:
+                key_start = time.time()
+                cleaned_content, rewritten = rewrite_m3u8_key_uris(
+                    m3u8_content=cleaned_content,
+                    m3u8_url_for_base=final_m3u8_url_for_base,
+                    api_base_url=self.api_base_url,
+                    session=self.session,
+                )
+                key_time = time.time() - key_start
+                if rewritten > 0:
+                    logger.info(f"z参数解析器: KEY处理完成（改写{rewritten}处，耗时: {key_time:.2f}秒）")
+            except Exception as e:
+                logger.warning(f"z参数解析器: KEY处理失败（忽略，继续返回原m3u8）: {e}")
             
             # 生成文件名
             from datetime import datetime
